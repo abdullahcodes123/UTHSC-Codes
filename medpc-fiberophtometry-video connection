@@ -1,0 +1,568 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import cv2
+
+# =========================
+# PATHS
+# =========================
+desktop = Path("/Users/abdullah/Desktop")
+beh_file   = desktop / "deneme.csv"
+fiber_file = desktop / "fiber.csv"
+video_file = desktop / "Abdullah.avi"
+
+root   = desktop / "abdullah_deneme"
+figdir = root / "figures"
+viddir = root / "videos"
+figdir.mkdir(parents=True, exist_ok=True)
+viddir.mkdir(parents=True, exist_ok=True)
+
+# =========================
+# PARAMS
+# =========================
+PRE  = 5.0
+POST = 5.0
+CLIP_PRE  = 5.0
+CLIP_POST = 5.0
+
+CLUSTER_WIN = 0.5  # seconds
+
+PEAK_SEARCH_START = 0.0
+PEAK_SEARCH_END   = 3.0
+
+BASE_START = -5.0
+BASE_END   = 0.0
+
+EVENT_REFRACTORY = 5.0
+TARGET_CLIPS = 10
+TOL_MANUAL = 3.0
+
+A_MF_PAD = 0.02
+A_MF_STEP_COARSE = 0.0005
+B_MF_MIN = -300.0
+B_MF_MAX = 300.0
+B_MF_STEP_COARSE = 0.1
+B_MF_STEP_FINE = 0.02
+
+# =========================
+# MANUAL NOSEPOKES (VIDEO timeline)
+# =========================
+manual_0_10_txt = ["1.36","2.52","3.34","4.23","4.39","5.10","6.36","6.45","7.00","7.51","8.23","9.49"]
+manual_35_45_txt = ["36.10","38.15","40.12","43.01","43.11"]
+
+def parse_mmss_to_seconds(s: str) -> float:
+    s = s.strip()
+    if "." in s:
+        mm, ss = s.split(".", 1)
+        return int(mm)*60 + int(ss)
+    return float(s)
+
+manual_0_10 = np.array([parse_mmss_to_seconds(x) for x in manual_0_10_txt], dtype=float)
+manual_35_45 = np.array([parse_mmss_to_seconds(x) for x in manual_35_45_txt], dtype=float)
+
+# =========================
+# HELPERS
+# =========================
+def cluster_events(times: np.ndarray, win: float) -> np.ndarray:
+    times = np.sort(times.astype(float))
+    out = []
+    i = 0
+    while i < len(times):
+        t0 = float(times[i])
+        out.append(t0)
+        j = i + 1
+        while j < len(times) and float(times[j]) - t0 <= win:
+            j += 1
+        i = j
+    return np.array(out, dtype=float)
+
+def robust_z(trace: np.ndarray, base_mask: np.ndarray) -> np.ndarray:
+    base = trace[base_mask]
+    med = float(np.median(base))
+    mad = float(np.median(np.abs(base - med)))
+    if mad == 0 or np.isnan(mad):
+        return np.full_like(trace, np.nan, dtype=float)
+    return (trace - med) / mad
+
+def infer_fiber_cols(df: pd.DataFrame):
+    cols = list(df.columns)
+
+    def pick(name_list, fallback_idx):
+        for n in name_list:
+            if n in cols:
+                return n
+        return cols[fallback_idx] if len(cols) > fallback_idx else cols[0]
+
+    time_cands = [c for c in cols if "time" in c.lower()]
+    sig_cands  = [c for c in cols if "sig" in c.lower() or "490" in c.lower()]
+    ctl_cands  = [c for c in cols if "ctl" in c.lower() or "control" in c.lower() or "405" in c.lower() or "iso" in c.lower()]
+
+    time_col = pick(["TimeStamp","Time(s)"], 0)
+    if time_col not in cols and time_cands:
+        time_col = time_cands[0]
+
+    sig_col = pick(["Signal"], 1)
+    if sig_col not in cols and sig_cands:
+        sig_col = sig_cands[0]
+
+    ctl_col = pick(["Control"], 2)
+    if ctl_col not in cols and ctl_cands:
+        ctl_col = ctl_cands[0]
+
+    return time_col, sig_col, ctl_col
+
+def normalize_to_seconds_by_dt(t: np.ndarray, target_fs=1000.0):
+    t = t.astype(float)
+    t = t - np.nanmin(t)
+    dt = float(np.nanmedian(np.diff(np.sort(t))))
+    if dt <= 0:
+        return t, 1.0
+
+    fs = 1.0 / dt
+    scale = 1.0
+    if fs > 50000:
+        scale = 1e-6
+    elif fs > 5000:
+        scale = 1e-3
+    elif fs < 50 and np.nanmax(t) > 20000:
+        scale = 1e-3
+
+    t2 = (t * scale).astype(float)
+    t2 = t2 - float(np.min(t2))
+    return t2, scale
+
+def greedy_match_mae(manual: np.ndarray, cand: np.ndarray, tol=3.0):
+    cand = np.sort(cand.astype(float))
+    i = 0
+    errs = []
+    misses = 0
+    for m in manual:
+        while i < len(cand) and cand[i] < (m - tol):
+            i += 1
+        if i >= len(cand):
+            misses += 1
+            continue
+        idxs = [i]
+        if i-1 >= 0: idxs.append(i-1)
+        if i+1 < len(cand): idxs.append(i+1)
+        idxs = sorted(set(idxs))
+        diffs = [abs(cand[k]-m) for k in idxs]
+        kbest = idxs[int(np.argmin(diffs))]
+        err = abs(cand[kbest]-m)
+        if err <= tol:
+            errs.append(err)
+            i = kbest + 1
+        else:
+            misses += 1
+    if len(errs) == 0:
+        return None
+    return float(np.mean(errs)), int(misses)
+
+def best_affine_medpc_to_video(man1, mp1, man2, mp2):
+    dur_man = max(man2.max(), man1.max())
+    dur_mp  = max(mp2.max() if len(mp2) else 0, mp1.max() if len(mp1) else 0)
+    if dur_mp <= 0:
+        raise RuntimeError("MedPC events look empty in the selected windows.")
+
+    a0 = dur_man / dur_mp
+    a_list = np.arange(max(0.95, a0-0.03), min(1.05, a0+0.03), 0.0005)
+    b_list = np.arange(-300, 300.01, 0.05)
+
+    best = None
+    for a in a_list:
+        c1 = a*mp1
+        c2 = a*mp2
+        for b in b_list:
+            r1 = greedy_match_mae(man1, c1 + b, tol=TOL_MANUAL)
+            r2 = greedy_match_mae(man2, c2 + b, tol=TOL_MANUAL)
+            if r1 is None and r2 is None:
+                continue
+            mae1, miss1 = (10.0, len(man1)) if r1 is None else r1
+            mae2, miss2 = (10.0, len(man2)) if r2 is None else r2
+            score = (mae1+mae2) + 2.0*(miss1+miss2)
+            if best is None or score < best["score"]:
+                best = dict(a=a, b=b, score=score,
+                            mae_0_10=mae1, miss_0_10=miss1,
+                            mae_35_45=mae2, miss_35_45=miss2)
+    if best is None:
+        raise RuntimeError("Failed to estimate MedPC->Video affine mapping.")
+    return best
+
+def score_medpc_to_fiber(a, b, mp_times, t_fiber, dff, epoch, base_mask, search_mask):
+    ev = a*mp_times + b
+    ok = (ev - PRE >= t_fiber.min()) & (ev + POST <= t_fiber.max())
+    ev = ev[ok]
+    if len(ev) < 10:
+        return -1e9, 0
+
+    peaks = []
+    for e in ev:
+        tr = np.interp(e + epoch, t_fiber, dff)
+        rz = robust_z(tr, base_mask)
+        zz = rz[search_mask]
+        if np.all(np.isnan(zz)):
+            continue
+        peaks.append(float(np.nanmax(zz)))
+    if len(peaks) < 10:
+        return -1e9, len(peaks)
+    return float(np.median(np.array(peaks))), len(peaks)
+
+def auc_trapz(y: np.ndarray, x: np.ndarray, t0: float, t1: float) -> float:
+    m = (x >= t0) & (x <= t1) & np.isfinite(y) & np.isfinite(x)
+    if np.sum(m) < 2:
+        return float("nan")
+    # numpy environments sometimes miss np.trapz; trapezoid is the modern name
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y[m], x[m]))
+    # last-resort fallback (should not be needed)
+    return float(((y[m][1:] + y[m][:-1]) * 0.5 * np.diff(x[m])).sum())
+
+# =========================
+# 1) LOAD MEDPC
+# =========================
+bdf = pd.read_csv(beh_file)
+if "self_administrator" not in bdf.columns:
+    raise ValueError(f"'self_administrator' not found. Columns: {list(bdf.columns)}")
+
+mp = pd.to_numeric(bdf["self_administrator"], errors="coerce").dropna().to_numpy()
+mp = mp[mp > 0].astype(float)
+mp = np.sort(mp)
+
+mp_s, mp_scale = normalize_to_seconds_by_dt(mp, target_fs=50)
+mp_s = mp_s - float(np.min(mp_s))
+mp_s = cluster_events(mp_s, CLUSTER_WIN)
+
+mp_idx = np.arange(1, len(mp_s) + 1, dtype=int)
+
+print(f"[OK] MedPC clustered events: n={len(mp_s)} scale={mp_scale} range={mp_s.min():.1f}..{mp_s.max():.1f}s")
+
+mp_0_10  = mp_s[(mp_s >= 0) & (mp_s <= 600)]
+mp_35_45 = mp_s[(mp_s >= 35*60) & (mp_s <= 45*60)]
+print(f"[OK] MedPC windows: first10min n={len(mp_0_10)} | 35-45min n={len(mp_35_45)}")
+
+# =========================
+# 2) LOAD FIBER
+# =========================
+fdf = pd.read_csv(fiber_file)
+time_col, sig_col, ctl_col = infer_fiber_cols(fdf)
+
+t = pd.to_numeric(fdf[time_col], errors="coerce")
+sig = pd.to_numeric(fdf[sig_col], errors="coerce")
+ctl = pd.to_numeric(fdf[ctl_col], errors="coerce")
+mask = t.notna() & sig.notna() & ctl.notna()
+t = t[mask].to_numpy().astype(float)
+sig = sig[mask].to_numpy().astype(float)
+ctl = ctl[mask].to_numpy().astype(float)
+
+t, t_scale = normalize_to_seconds_by_dt(t, target_fs=1000.0)
+dt = float(np.median(np.diff(t)))
+fs = 1.0/dt
+print(f"[FIBER] time={time_col} signal={sig_col} control={ctl_col} time_scale={t_scale} Fs≈{fs:.1f}Hz range={t.min():.1f}..{t.max():.1f}s")
+
+a_fit, b_fit = np.polyfit(ctl, sig, 1)
+fit_ctl = a_fit*ctl + b_fit
+dff = (sig - fit_ctl) / fit_ctl
+
+epoch = np.arange(-PRE, POST + dt, dt)
+base_mask = (epoch >= BASE_START) & (epoch < BASE_END)
+search_mask = (epoch >= PEAK_SEARCH_START) & (epoch <= PEAK_SEARCH_END)
+
+# =========================
+# 3) MedPC->FIBER alignment
+# =========================
+dur_mp = float(np.max(mp_s)) if len(mp_s) else 1.0
+dur_f  = float(np.max(t))
+a0 = dur_f / dur_mp
+a_list = np.arange(max(0.8, a0 - A_MF_PAD), min(1.2, a0 + A_MF_PAD) + 1e-12, A_MF_STEP_COARSE)
+b_list = np.arange(B_MF_MIN, B_MF_MAX + 1e-12, B_MF_STEP_COARSE)
+
+mp_focus = np.concatenate([mp_0_10, mp_35_45]) if (len(mp_0_10)+len(mp_35_45))>0 else mp_s
+
+best_mf = None
+for a in a_list:
+    for b in b_list:
+        sc, nused = score_medpc_to_fiber(a, b, mp_focus, t, dff, epoch, base_mask, search_mask)
+        if best_mf is None or sc > best_mf["score"]:
+            best_mf = {"a": float(a), "b": float(b), "score": float(sc), "nused": int(nused)}
+
+if best_mf is None or best_mf["score"] < -1e8:
+    raise RuntimeError("Failed to find MedPC->Fiber alignment.")
+
+a_mf = best_mf["a"]
+b0 = best_mf["b"]
+b_list2 = np.arange(b0-3.0, b0+3.0+1e-12, B_MF_STEP_FINE)
+
+best2 = None
+for b in b_list2:
+    sc, nused = score_medpc_to_fiber(a_mf, b, mp_focus, t, dff, epoch, base_mask, search_mask)
+    if best2 is None or sc > best2["score"]:
+        best2 = {"a": a_mf, "b": float(b), "score": float(sc), "nused": int(nused)}
+
+a_mf, b_mf = best2["a"], best2["b"]
+print(f"[ALIGN MF] t_fiber = {a_mf:.6f}*t_medpc + {b_mf:.3f} (peak_median={best2['score']:.3f}, nused={best2['nused']})")
+
+# =========================
+# 4) MedPC->VIDEO alignment
+# =========================
+mv = best_affine_medpc_to_video(manual_0_10, mp_0_10, manual_35_45, mp_35_45)
+a_mv, b_mv = float(mv["a"]), float(mv["b"])
+print(f"[ALIGN MV] t_video = {a_mv:.6f}*t_medpc + {b_mv:.3f} "
+      f"(MAE0-10={mv['mae_0_10']:.2f}s miss={mv['miss_0_10']} | MAE35-45={mv['mae_35_45']:.2f}s miss={mv['miss_35_45']})")
+
+# =========================
+# 5) Peri-event for ALL events
+# =========================
+ev_fiber_all = a_mf*mp_s + b_mf
+ok_fiber = (ev_fiber_all - PRE >= t.min()) & (ev_fiber_all + POST <= t.max())
+
+mp_ok = mp_s[ok_fiber]
+mp_ok_idx = mp_idx[ok_fiber]
+ev_fiber = ev_fiber_all[ok_fiber]
+
+print(f"[OK] Events usable in fiber: n={len(ev_fiber)}")
+
+rz_trials = []
+peak_z = []
+peak_off = []
+for e in ev_fiber:
+    tr = np.interp(e + epoch, t, dff)
+    rz = robust_z(tr, base_mask)
+    zz = rz[search_mask]
+    tt = epoch[search_mask]
+    if np.all(np.isnan(zz)):
+        rz_trials.append(rz)
+        peak_z.append(np.nan)
+        peak_off.append(0.0)
+        continue
+    k = int(np.nanargmax(zz))
+    rz_trials.append(rz)
+    peak_z.append(float(zz[k]))
+    peak_off.append(float(tt[k]))
+
+rz_trials = np.vstack(rz_trials) if len(rz_trials) else np.zeros((0, len(epoch)))
+peak_z = np.array(peak_z, dtype=float)
+peak_off = np.array(peak_off, dtype=float)
+
+# =========================
+# 5B) Full event table + video bounds
+# =========================
+t_video_event_all = a_mv*mp_ok + b_mv
+t_video_peak_all = t_video_event_all + (a_mv/a_mf)*peak_off
+
+cap_tmp = cv2.VideoCapture(str(video_file))
+if not cap_tmp.isOpened():
+    raise RuntimeError("Could not open video file (codec).")
+fps_v = cap_tmp.get(cv2.CAP_PROP_FPS)
+nframes = int(cap_tmp.get(cv2.CAP_PROP_FRAME_COUNT))
+dur_v = nframes / fps_v
+W = int(cap_tmp.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(cap_tmp.get(cv2.CAP_PROP_FRAME_HEIGHT))
+cap_tmp.release()
+
+ok_video = (t_video_peak_all - CLIP_PRE >= 0) & (t_video_peak_all + CLIP_POST <= dur_v)
+print(f"[OK] Events also usable in video (for {CLIP_PRE}+{CLIP_POST}s clips): n={int(np.sum(ok_video))}")
+
+all_events_df = pd.DataFrame({
+    "nosepoke_index": mp_ok_idx.astype(int),
+    "t_medpc_s": mp_ok.astype(float),
+    "t_fiber_event_s": ev_fiber.astype(float),
+    "peak_offset_fiber_s": peak_off.astype(float),
+    "peak_robust_z": peak_z.astype(float),
+    "t_video_event_s": t_video_event_all.astype(float),
+    "t_video_peak_s": t_video_peak_all.astype(float),
+    "usable_in_video": ok_video.astype(bool),
+})
+all_events_csv = root / "all_aligned_events.csv"
+all_events_df.to_csv(all_events_csv, index=False)
+print(f"[OK] Saved: {all_events_csv}")
+
+# =========================
+# 6) Select TOP peaks (no duplicate blocks)
+# =========================
+order = np.argsort(-np.nan_to_num(peak_z, nan=-1e9))
+chosen = []
+used_mp = []
+for idx0 in order:
+    t_mp = float(mp_ok[idx0])
+    if any(abs(t_mp - u) < EVENT_REFRACTORY for u in used_mp):
+        continue
+    chosen.append(idx0)
+    used_mp.append(t_mp)
+    if len(chosen) >= 200:
+        break
+chosen = np.array(chosen, dtype=int)
+
+# =========================
+# 7) pick top 10 valid clips
+# =========================
+valid = []
+for idx0 in chosen:
+    if not ok_video[idx0]:
+        continue
+    valid.append((idx0, float(t_video_peak_all[idx0]), float(t_video_event_all[idx0])))
+    if len(valid) >= TARGET_CLIPS:
+        break
+
+print(f"[OK] Valid clips: n={len(valid)} (target={TARGET_CLIPS})")
+
+# =========================
+# 8) TOP10 summary + grid
+# =========================
+summary = []
+for rank, (idx0, tpkv, tev) in enumerate(valid, start=1):
+    summary.append({
+        "rank": rank,
+        "nosepoke_index": int(mp_ok_idx[idx0]),
+        "t_medpc_s": float(mp_ok[idx0]),
+        "t_fiber_event_s": float(ev_fiber[idx0]),
+        "peak_offset_fiber_s": float(peak_off[idx0]),
+        "peak_robust_z": float(peak_z[idx0]),
+        "t_video_event_s": float(tev),
+        "t_video_peak_s": float(tpkv),
+    })
+
+summary_df = pd.DataFrame(summary)
+summary_csv = root / "top10_np1_summary.csv"
+summary_df.to_csv(summary_csv, index=False)
+print(f"[OK] Saved: {summary_csv}")
+
+grid_png = figdir / "top10_peri_event_robustZ_grid.png"
+if len(valid) > 0:
+    plt.figure(figsize=(18, 6))
+    ncols = 5
+    nrows = int(np.ceil(len(valid)/ncols))
+    for j, (idx0, tpkv, tev) in enumerate(valid, start=1):
+        ax = plt.subplot(nrows, ncols, j)
+        ax.plot(epoch, rz_trials[idx0], linewidth=1)
+        ax.axvline(0, linestyle="--", linewidth=1)
+        ax.axvline(peak_off[idx0], linestyle=":", linewidth=1)
+        ax.set_title(f"#{j} | Z={peak_z[idx0]:.2f} | NP#{int(mp_ok_idx[idx0])}")
+        ax.set_xlabel("Time (s) relative to nosepoke")
+        ax.set_ylabel("Robust Z (dF/F)")
+        ax.set_xlim(-PRE, POST)
+    plt.tight_layout()
+    plt.savefig(grid_png, dpi=200)
+    plt.close()
+print(f"[OK] Saved: {grid_png}")
+
+# =========================
+# 8B) ALL EVENTS average peri-event + AUC
+# =========================
+finite_rows = np.all(np.isfinite(rz_trials), axis=1)
+rz_valid = rz_trials[finite_rows]
+if rz_valid.shape[0] >= 5:
+    mean_rz = np.nanmean(rz_valid, axis=0)
+    sem_rz = np.nanstd(rz_valid, axis=0, ddof=1) / np.sqrt(rz_valid.shape[0])
+
+    auc_0_3 = auc_trapz(mean_rz, epoch, 0.0, 3.0)
+    auc_0_5 = auc_trapz(mean_rz, epoch, 0.0, 5.0)
+
+    auc_df = pd.DataFrame([{
+        "n_events_used": int(rz_valid.shape[0]),
+        "AUC_mean_trace_0_3s": auc_0_3,
+        "AUC_mean_trace_0_5s": auc_0_5
+    }])
+    auc_csv = root / "all_events_mean_trace_auc.csv"
+    auc_df.to_csv(auc_csv, index=False)
+    print(f"[OK] Saved: {auc_csv}")
+
+    avg_png = figdir / "all_events_mean_peri_event_robustZ.png"
+    plt.figure(figsize=(10, 5))
+    plt.plot(epoch, mean_rz, linewidth=2, label="Mean Robust Z")
+    plt.fill_between(epoch, mean_rz - sem_rz, mean_rz + sem_rz, alpha=0.25, label="SEM")
+    plt.axvline(0, linestyle="--", linewidth=1)
+    plt.xlim(-PRE, POST)
+    plt.xlabel("Time (s) relative to nosepoke")
+    plt.ylabel("Robust Z (dF/F)")
+    plt.title(f"All aligned nosepokes (n={rz_valid.shape[0]}) | AUC(0-3s)={auc_0_3:.3f}, AUC(0-5s)={auc_0_5:.3f}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(avg_png, dpi=200)
+    plt.close()
+    print(f"[OK] Saved: {avg_png}")
+else:
+    print("[WARN] Not enough finite peri-event trials for mean/SEM and AUC.")
+
+# =========================
+# 9) Write 1..10 clips (exactly 5s before + 5s after)
+# =========================
+cap = cv2.VideoCapture(str(video_file))
+if not cap.isOpened():
+    raise RuntimeError("Could not open video file (codec).")
+
+fps_v = cap.get(cv2.CAP_PROP_FPS)
+nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+dur_v = nframes / fps_v
+W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+print(f"[VIDEO] fps={fps_v:.2f} dur≈{dur_v:.1f}s size={W}x{H}")
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+for rank, (idx0, tpkv, tev) in enumerate(valid, start=1):
+    start_t = tpkv - CLIP_PRE
+    end_t   = tpkv + CLIP_POST
+
+    start_fr = int(round(start_t * fps_v))
+    end_fr   = int(round(end_t * fps_v))
+
+    out_clip = viddir / f"{rank}.mp4"
+    writer = cv2.VideoWriter(str(out_clip), fourcc, fps_v, (W, H))
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_fr)
+    cur = start_fr
+
+    np_index = int(mp_ok_idx[idx0])
+    t_medpc = float(mp_ok[idx0])
+    zpk = float(peak_z[idx0])
+    pkoff = float(peak_off[idx0])
+    t_vid_peak = float(tpkv)
+
+    while cur <= end_fr:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        line1 = f"Clip {rank} | PeakZ={zpk:.2f} | VideoPeak={t_vid_peak:.2f}s"
+        line2 = f"MedPC={t_medpc:.2f}s | NosepokeIndex={np_index} | PeakOffsetFiber={pkoff:.2f}s"
+
+        cv2.putText(frame, line1, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                    (255,255,255), 2, cv2.LINE_AA)
+        cv2.putText(frame, line2, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.75,
+                    (255,255,255), 2, cv2.LINE_AA)
+
+        writer.write(frame)
+        cur += 1
+
+    writer.release()
+    print(f"[OK] Clip saved: {out_clip} (5s before + 5s after)")
+
+cap.release()
+
+# =========================
+# 10) Alignment report
+# =========================
+rep = figdir / "alignment_report.txt"
+with open(rep, "w", encoding="utf-8") as f:
+    f.write("TIME MAPPINGS\n")
+    f.write(f"MedPC time scale applied: {mp_scale}\n")
+    f.write(f"Fiber time scale applied: {t_scale}\n\n")
+    f.write("MedPC -> Fiber:\n")
+    f.write("  t_fiber = a_mf * t_medpc + b_mf\n")
+    f.write(f"  a_mf = {a_mf:.9f}\n")
+    f.write(f"  b_mf = {b_mf:.6f}\n\n")
+    f.write("MedPC -> Video:\n")
+    f.write("  t_video = a_mv * t_medpc + b_mv\n")
+    f.write(f"  a_mv = {a_mv:.9f}\n")
+    f.write(f"  b_mv = {b_mv:.6f}\n\n")
+    f.write("pMAT-style processing:\n")
+    f.write("  fitted_control = a * control + b (least-squares regression)\n")
+    f.write("  dF/F = (signal - fitted_control) / fitted_control\n")
+    f.write("  Robust Z = (dF/F - median(baseline)) / MAD(baseline)\n")
+    f.write(f"  Peri-event window: [-{PRE}, +{POST}] s\n")
+    f.write(f"  Baseline window: [{BASE_START}, {BASE_END}) s\n")
+    f.write(f"  Peak search window: [{PEAK_SEARCH_START}, {PEAK_SEARCH_END}] s\n")
+print(f"[OK] Saved: {rep}")
+
+print("\n[DONE] Outputs:", root)
