@@ -1,0 +1,1425 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import cv2
+
+# ============================================================
+# PURPOSE (READ THIS)
+# ============================================================
+# This script aligns 3 time domains:
+#   (1) MedPC event timestamps  (deneme.csv: multiple candidate columns)
+#   (2) Fiber photometry time   (fiber.csv: Signal/Control + timestamps)
+#   (3) Video time              (Abdullah.avi)
+#
+# It then:
+#   - Photobleach-corrects Signal/Control using EMA trend removal
+#   - Computes pMAT-style dF/F from PB-corrected channels
+#   - Aligns MedPC->Video using MANUAL nosepoke anchors (now 3 windows: 0-10, mid, 35-45)
+#   - Aligns MedPC->Fiber using a VIDEO-GROUNDED objective (prefers alignments that also yield valid clips)
+#   - For ALL aligned events, computes robust Z peri-event traces
+#   - Extracts BOTH "increase" (max) and "decrease" (min) within response window [0..3s]
+#   - Saves:
+#       * all_aligned_events.csv (full event table with both pos/neg peaks)
+#       * top10 summaries (increase + decrease)
+#       * peri-event grids for top10 (increase + decrease)
+#       * mean peri-event + AUC (net + pos-only + neg-only)
+#       * 10 clips for strongest increases and 10 clips for strongest decreases
+#
+# NEW (Validation harness):
+#   - MV bootstrap: estimates variability of MedPC->Video (a,b) and error across anchor windows
+#   - MF bootstrap: evaluates stability of MedPC->Fiber scoring around the chosen optimum
+#   - Basic automatic checks + a validation report saved per case
+#
+# NOTE:
+#   - Manual anchors are dataset-specific by nature. We now include MID anchors to reduce drift in the middle.
+#   - This code runs the full pipeline for TWO candidate MedPC columns (if available),
+#     because you don't know which is demonstrator vs self_administrator. Because while pulling the cables from the middle, 
+we might have rotated the wall in the center.
+# ============================================================
+
+
+# ============================================================
+# PATHS
+# ============================================================
+desktop = Path("/content/drive/MyDrive/deneme")
+beh_file   = desktop / "deneme.csv"
+fiber_file = desktop / "fiber.csv"
+video_file = desktop / "Abdullah.avi"
+
+root = desktop / "abdullah_deneme"
+root.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# PARAMS
+# ============================================================
+# Peri-event window for photometry around each event
+PRE  = 5.0
+POST = 5.0
+
+# Video clip window around chosen peak time (always 5s before + 5s after => 10s clips)
+CLIP_PRE  = 5.0
+CLIP_POST = 5.0
+
+# MedPC "bounce" filter: MedPC sometimes double-counts; collapse events within this window : it was 0.5 but it makes too much noise thats why increased that
+CLUSTER_WIN = 2.0  # seconds
+
+# Response window after the event where we look for BOTH increases and decreases( if peak happen before of nose poke , like motivation)
+PEAK_SEARCH_START = -5.0
+PEAK_SEARCH_END   = 5.0
+
+# Baseline window (used for robust Z normalization- i just update here trying to find more robust scores, based on best results we can change here)
+BASE_START = -5.0
+BASE_END   = 5.0
+
+# When selecting Top events, avoid picking events too close in MedPC time
+EVENT_REFRACTORY = 5.0  # seconds (in MedPC domain)
+
+# Clip selection ( example clips of top 10) ( we can delete video generating as well, because from my understanding it generally come with motor activity noise, but half of that associated nosepoking)
+TARGET_CLIPS = 10
+
+# Manual-video anchor tolerance (seconds) for MV mapping scoring
+TOL_MANUAL = 5.0
+
+# MedPC -> Fiber alignment grid search ranges
+A_MF_PAD = 0.02 #It checks whether there is a continuous and linear (straight-line) shift. We can play around with this.
+A_MF_STEP_COARSE = 0.0005 #It divides the distance in the range ‘A_MF_PAD = 0.02’ into steps of 0.005 and makes it possible to find the actual speed
+B_MF_MIN = -300.0 #if the start time is different from medpc -> fiber. it find 5 mins distance.
+B_MF_MAX = 300.0
+B_MF_STEP_COARSE = 0.1 #start point scanned every 0.1 second.
+B_MF_STEP_FINE = 0.02 # rescan by 0.02 seconds.
+
+# Video-grounded objective weights for MF search ( it searching for valid video clibs)
+MF_ALPHA_VALID = 0.8    # reward alignments yielding many valid video peaks for clipping
+MF_B_STABIL = 0.001     # mild penalty for huge |b| shifts (prevents absurd offsets)
+MF_MIN_EVENTS = 10      # minimum events needed to score a candidate mapping
+MF_COARSE_MAX_EVENTS = 80  # subsample events for coarse scoring (speed, deterministic)
+
+# Photobleaching correction: EMA time constant in seconds (bigger => smoother trend)
+PB_TAU_SEC = 60.0
+
+# Validation harness
+BOOTSTRAP_MV_N = 200   # bootstrap runs for MedPC->Video mapping
+BOOTSTRAP_MF_N = 80    # bootstrap runs for MedPC->Fiber stability checks
+BOOTSTRAP_SEED = 123   # fixed seed => deterministic results
+
+# "Middle window" for manual anchors (video time), used to reduce drift mid-session
+MID_WIN_START_S = 10 * 60
+MID_WIN_END_S   = 35 * 60
+
+
+# ============================================================
+# MANUAL NOSEPOKES (VIDEO timeline, format mm.ss)
+# ============================================================
+# Existing anchors:
+manual_0_10_txt = ["1.36","2.52","3.34","4.23","4.39","5.10","6.36","6.45","7.00","7.51","8.23","9.49"]
+manual_35_45_txt = ["36.10","38.15","40.12","43.01","43.11"]
+
+# NEW middle anchors you gave (to stabilize mid alignment):
+# 12.27 (long), 13.19, 21.07 (busy), 27.23, 31.56
+manual_mid_txt = ["12.27","13.19","21.07","27.23","31.56"]
+
+
+def parse_mmss_to_seconds(s: str) -> float:
+    """
+    Parse 'mm.ss' where '.' separates minutes and seconds.
+    Example: '12.27' -> 12*60 + 27 = 747 seconds.
+    """
+    s = s.strip()
+    if "." in s:
+        mm, ss = s.split(".", 1)
+        return int(mm) * 60 + int(ss)
+    return float(s)
+
+
+manual_0_10 = np.array([parse_mmss_to_seconds(x) for x in manual_0_10_txt], dtype=float)
+manual_mid  = np.array([parse_mmss_to_seconds(x) for x in manual_mid_txt], dtype=float)
+manual_35_45 = np.array([parse_mmss_to_seconds(x) for x in manual_35_45_txt], dtype=float)
+
+# Use ALL manual anchors for nearest-distance debugging
+manual_all = np.sort(np.concatenate([manual_0_10, manual_mid, manual_35_45]).astype(float))
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def cluster_events(times: np.ndarray, win: float) -> np.ndarray:
+    """
+    Collapse event "bounces": keep the first event in each cluster of events
+    that fall within win seconds of that first event.
+    """
+    times = np.sort(times.astype(float))
+    out = []
+    i = 0
+    while i < len(times):
+        t0 = float(times[i])
+        out.append(t0)
+        j = i + 1
+        while j < len(times) and float(times[j]) - t0 <= win:
+            j += 1
+        i = j
+    return np.array(out, dtype=float)
+
+
+def robust_z(trace: np.ndarray, base_mask: np.ndarray) -> np.ndarray:
+    """
+    Robust Z-score using baseline median and MAD.
+      z = (x - median(baseline)) / MAD(baseline)
+    MAD = median(|x - median|)
+    If MAD==0, return NaNs.
+    """
+    base = trace[base_mask]
+    med = float(np.median(base))
+    mad = float(np.median(np.abs(base - med)))
+    if mad == 0 or np.isnan(mad):
+        return np.full_like(trace, np.nan, dtype=float)
+    return (trace - med) / mad
+
+
+def infer_fiber_cols(df: pd.DataFrame):
+    """
+    Tries to infer fiber columns for time/signal/control from common names or heuristics.
+    """
+    cols = list(df.columns)
+
+    def pick(name_list, fallback_idx):
+        for n in name_list:
+            if n in cols:
+                return n
+        return cols[fallback_idx] if len(cols) > fallback_idx else cols[0]
+
+    time_cands = [c for c in cols if "time" in c.lower()]
+    sig_cands  = [c for c in cols if ("sig" in c.lower()) or ("490" in c.lower())]
+    ctl_cands  = [c for c in cols if ("ctl" in c.lower()) or ("control" in c.lower()) or ("405" in c.lower()) or ("iso" in c.lower())]
+
+    time_col = pick(["TimeStamp", "Time(s)"], 0)
+    if time_col not in cols and time_cands:
+        time_col = time_cands[0]
+
+    sig_col = pick(["Signal"], 1)
+    if sig_col not in cols and sig_cands:
+        sig_col = sig_cands[0]
+
+    ctl_col = pick(["Control"], 2)
+    if ctl_col not in cols and ctl_cands:
+        ctl_col = ctl_cands[0]
+
+    return time_col, sig_col, ctl_col
+
+
+def normalize_to_seconds_by_dt(t: np.ndarray):
+    """
+    If timestamps are in ms/us, scale to seconds by inspecting dt and value ranges.
+    No fixed sampling rate is assumed.
+
+    Returns:
+      t_seconds, scale_applied (1.0, 1e-3, 1e-6)
+    """
+    t = t.astype(float)
+    t = t - np.nanmin(t)
+    dt = float(np.nanmedian(np.diff(np.sort(t))))
+    if dt <= 0 or not np.isfinite(dt):
+        return t, 1.0
+
+    fs = 1.0 / dt
+    scale = 1.0
+    if fs > 50000:            # microseconds-like
+        scale = 1e-6
+    elif fs > 5000:           # milliseconds-like
+        scale = 1e-3
+    elif fs < 50 and np.nanmax(t) > 20000:  # huge values but slow dt => ms
+        scale = 1e-3
+
+    t2 = (t * scale).astype(float)
+    t2 = t2 - float(np.min(t2))
+    return t2, scale
+
+
+def greedy_match_mae(manual: np.ndarray, cand: np.ndarray, tol=3.0):
+    """
+    Greedy matching from manual anchor times to candidate event times:
+      - For each manual time, find closest candidate time within +/-tol seconds.
+      - Each candidate can be used at most once (greedy forward).
+
+    Returns:
+      (mean_abs_error, misses) or None if no matches.
+    """
+    cand = np.sort(cand.astype(float))
+    i = 0
+    errs = []
+    misses = 0
+
+    for m in manual:
+        while i < len(cand) and cand[i] < (m - tol):
+            i += 1
+        if i >= len(cand):
+            misses += 1
+            continue
+
+        idxs = [i]
+        if i - 1 >= 0:
+            idxs.append(i - 1)
+        if i + 1 < len(cand):
+            idxs.append(i + 1)
+        idxs = sorted(set(idxs))
+
+        diffs = [abs(cand[k] - m) for k in idxs]
+        kbest = idxs[int(np.argmin(diffs))]
+        err = abs(cand[kbest] - m)
+
+        if err <= tol:
+            errs.append(err)
+            i = kbest + 1
+        else:
+            misses += 1
+
+    if len(errs) == 0:
+        return None
+    return float(np.mean(errs)), int(misses)
+
+
+def best_affine_medpc_to_video_multi(windows, tol=3.0):
+    """
+    Estimate MedPC->Video affine map:
+      t_video = a_mv * t_medpc + b_mv
+
+    windows: list of dicts:
+      {
+        "manual": np.array([...])   # manual times in VIDEO seconds
+        "mp":     np.array([...])   # MedPC event times in MEDPC seconds (already scaled/clustered)
+        "name":   str
+      }
+
+    We brute-force a,b around a duration ratio.
+    Score:
+      sum over windows: (mae_window) + 2*(misses_window)
+    Lower is better.
+    """
+    # require at least one non-empty window
+    usable = [w for w in windows if len(w["manual"]) > 0 and len(w["mp"]) > 0]
+    if len(usable) == 0:
+        raise RuntimeError("No usable MV windows (manual or MedPC windows are empty).")
+
+    dur_man = max([float(w["manual"].max()) for w in usable])
+    dur_mp  = max([float(w["mp"].max()) for w in usable])
+    if dur_mp <= 0:
+        raise RuntimeError("MedPC events look empty/invalid for MV estimation.")
+
+    a0 = dur_man / dur_mp
+    a_list = np.arange(max(0.95, a0 - 0.03), min(1.05, a0 + 0.03), 0.0005)
+    b_list = np.arange(-300, 300.01, 0.05)
+
+    best = None
+    for a in a_list:
+        for b in b_list:
+            total = 0.0
+            per = []
+            for w in usable:
+                r = greedy_match_mae(w["manual"], a * w["mp"] + b, tol=tol)
+                if r is None:
+                    mae, miss = 10.0, len(w["manual"])
+                else:
+                    mae, miss = r
+                total += mae + 2.0 * miss
+                per.append((w["name"], mae, miss))
+            if best is None or total < best["score"]:
+                best = {"a": float(a), "b": float(b), "score": float(total), "per": per}
+
+    if best is None:
+        raise RuntimeError("Failed to estimate MedPC->Video affine mapping.")
+    return best
+
+
+def auc_trapz(y: np.ndarray, x: np.ndarray, t0: float, t1: float) -> float:
+    """
+    AUC using trapezoid integration for y(x) between [t0, t1], ignoring non-finite values.
+    Works on NumPy versions with or without np.trapezoid.
+    """
+    m = (x >= t0) & (x <= t1) & np.isfinite(y) & np.isfinite(x)
+    if int(np.sum(m)) < 2:
+        return float("nan")
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y[m], x[m]))
+    return float(((y[m][1:] + y[m][:-1]) * 0.5 * np.diff(x[m])).sum())
+
+
+def nearest_dist_mean(query_times: np.ndarray, ref_times: np.ndarray) -> float:
+    """
+    For each query time, compute distance to nearest reference time; return mean distance.
+    Used for debug vs manual anchors.
+    """
+    if len(query_times) == 0 or len(ref_times) == 0:
+        return float("nan")
+    ref = np.sort(ref_times.astype(float))
+    qs = query_times.astype(float)
+    d = []
+    for q in qs:
+        j = int(np.searchsorted(ref, q))
+        cand = []
+        if 0 <= j < len(ref):
+            cand.append(abs(ref[j] - q))
+        if 0 <= j - 1 < len(ref):
+            cand.append(abs(ref[j - 1] - q))
+        if 0 <= j + 1 < len(ref):
+            cand.append(abs(ref[j + 1] - q))
+        d.append(min(cand) if cand else np.nan)
+    return float(np.nanmean(np.array(d, float)))
+
+
+def estimate_video_fps_if_needed(cap: cv2.VideoCapture, fps_meta: float) -> float:
+    """
+    Use OpenCV metadata if valid; otherwise estimate FPS from CAP_PROP_POS_MSEC.
+    """
+    if fps_meta is not None and np.isfinite(fps_meta) and fps_meta > 1.0:
+        return float(fps_meta)
+
+    # Try to estimate from first ~200 frames timestamps
+    ms_list = []
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    for _ in range(220):
+        ret, _ = cap.read()
+        if not ret:
+            break
+        ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if np.isfinite(ms) and ms > 0:
+            ms_list.append(ms)
+
+    if len(ms_list) < 10:
+        print("[WARN] Could not infer FPS. Falling back to 30.")
+        return 30.0
+
+    ms_list = np.array(ms_list, float)
+    dms = np.diff(ms_list)
+    dms = dms[np.isfinite(dms) & (dms > 0)]
+    if len(dms) < 5:
+        print("[WARN] Could not infer FPS reliably. Falling back to 30.")
+        return 30.0
+
+    fps_est = 1000.0 / float(np.median(dms))
+    if not np.isfinite(fps_est) or fps_est < 1.0:
+        print("[WARN] FPS estimate invalid. Falling back to 30.")
+        return 30.0
+    return float(fps_est)
+
+
+def photobleach_correct(sig: np.ndarray, ctl: np.ndarray, fs: float, tau_sec: float):
+    """
+    Photobleaching/drift correction using EMA trend removal.
+
+    Steps:
+      span_samples = tau_sec * fs
+      trend_sig = EMA(sig, span_samples)
+      trend_ctl = EMA(ctl, span_samples)
+      sig_n = sig / trend_sig
+      ctl_n = ctl / trend_ctl
+
+    This normalizes each channel by its slow trend, reducing "late-session weaker response"
+    purely due to drift/bleach.
+    """
+    span = int(max(10, round(tau_sec * fs)))
+    s = pd.Series(sig)
+    c = pd.Series(ctl)
+    trend_sig = s.ewm(span=span, adjust=False).mean().to_numpy(dtype=float)
+    trend_ctl = c.ewm(span=span, adjust=False).mean().to_numpy(dtype=float)
+    eps = 1e-12
+    sig_n = sig / (trend_sig + eps)
+    ctl_n = ctl / (trend_ctl + eps)
+    return sig_n, ctl_n, trend_sig, trend_ctl
+
+
+# ============================================================
+# MF SCORING (video-grounded, supports INCREASE/DECREASE/EITHER)
+# ============================================================
+def score_medpc_to_fiber_videogrounded(
+    a_mf: float, b_mf: float,
+    mp_times: np.ndarray,
+    t_fiber: np.ndarray, dff: np.ndarray,
+    epoch: np.ndarray, base_mask: np.ndarray, search_mask: np.ndarray,
+    a_mv: float, b_mv: float, dur_v: float,
+    direction: str = "either",   # "increase" | "decrease" | "either"
+):
+    """
+    We evaluate a candidate MedPC->Fiber map:
+      t_fiber_event = a_mf * t_medpc + b_mf
+
+    For events that fit in fiber peri window:
+      - compute robustZ peri-event
+      - within response window [0..3s], get:
+          peaks_pos = max(Z), peaks_neg = min(Z)
+          and their offsets (time within window)
+    Then build a score:
+
+    Core magnitude:
+      - "increase": median(peaks_pos)
+      - "decrease": median(-peaks_neg)  (positive magnitude)
+      - "either":   whichever has larger magnitude
+
+    Video grounding:
+      We convert the peak offset to video time:
+        t_video_event = a_mv * t_medpc + b_mv
+        t_video_peak  = t_video_event + (a_mv/a_mf) * peak_offset_fiber
+      Reward alignments that keep many peaks valid for clipping:
+        valid_ratio = fraction of peaks where (t_video_peak +/- clip window) stays within video duration
+
+    Final:
+      score = core_magnitude + MF_ALPHA_VALID*valid_ratio - MF_B_STABIL*abs(b_mf)
+
+    Returns:
+      score, n_good, valid_ratio, med_pos, med_neg
+    """
+    ev = a_mf * mp_times + b_mf
+    ok = (ev - PRE >= t_fiber.min()) & (ev + POST <= t_fiber.max())
+    mp_ok = mp_times[ok]
+    ev = ev[ok]
+    if len(ev) < MF_MIN_EVENTS:
+        return -1e9, 0, 0.0, np.nan, np.nan
+
+    tt = epoch[search_mask]
+    peaks_pos = []
+    peaks_neg = []
+    off_pos = []
+    off_neg = []
+
+    for e in ev:
+        tr = np.interp(e + epoch, t_fiber, dff)
+        rz = robust_z(tr, base_mask)
+        zz = rz[search_mask]
+        if np.all(np.isnan(zz)):
+            peaks_pos.append(np.nan); off_pos.append(np.nan)
+            peaks_neg.append(np.nan); off_neg.append(np.nan)
+            continue
+        kmax = int(np.nanargmax(zz))
+        kmin = int(np.nanargmin(zz))
+        peaks_pos.append(float(zz[kmax])); off_pos.append(float(tt[kmax]))
+        peaks_neg.append(float(zz[kmin])); off_neg.append(float(tt[kmin]))
+
+    peaks_pos = np.array(peaks_pos, float)
+    peaks_neg = np.array(peaks_neg, float)
+    off_pos = np.array(off_pos, float)
+    off_neg = np.array(off_neg, float)
+
+    good = np.isfinite(peaks_pos) & np.isfinite(peaks_neg) & np.isfinite(off_pos) & np.isfinite(off_neg)
+    if int(good.sum()) < MF_MIN_EVENTS:
+        return -1e9, int(good.sum()), 0.0, np.nan, np.nan
+
+    med_pos = float(np.nanmedian(peaks_pos[good]))
+    med_neg = float(np.nanmedian(peaks_neg[good]))         # typically negative
+    med_neg_mag = float(np.nanmedian((-peaks_neg)[good]))  # positive magnitude
+
+    if direction == "increase":
+        off_use = off_pos
+        core = med_pos
+    elif direction == "decrease":
+        off_use = off_neg
+        core = med_neg_mag
+    else:
+        # choose direction with larger typical magnitude
+        if np.isfinite(med_pos) and np.isfinite(med_neg_mag) and (med_neg_mag > med_pos):
+            off_use = off_neg
+            core = med_neg_mag
+        else:
+            off_use = off_pos
+            core = med_pos
+
+    t_video_event = a_mv * mp_ok + b_mv
+    t_video_peak = t_video_event + (a_mv / a_mf) * off_use
+    valid = (t_video_peak - CLIP_PRE >= 0) & (t_video_peak + CLIP_POST <= dur_v) & good
+    valid_ratio = float(np.mean(valid)) if len(valid) else 0.0
+
+    score = float(core + MF_ALPHA_VALID * valid_ratio - MF_B_STABIL * abs(b_mf))
+    return score, int(good.sum()), float(valid_ratio), med_pos, med_neg
+
+
+# ============================================================
+# VALIDATION HARNESS
+# ============================================================
+def bootstrap_mv(windows, best_a, best_b, tol, n_boot, seed):
+    """
+    Bootstrap MV mapping stability by resampling manual anchors WITH replacement within each window.
+    We do NOT re-gridsearch full a,b each time (too slow). Instead:
+      - keep a fixed candidate neighborhood around best_a, best_b
+      - search a small grid around them for each bootstrap sample.
+
+    Outputs:
+      DataFrame with columns: a,b,total_score, total_mae_equiv, total_miss, per-window mae/miss
+    """
+    rng = np.random.default_rng(seed)
+
+    # local small neighborhood around best parameters
+    a_list = np.arange(best_a - 0.0025, best_a + 0.0025 + 1e-12, 0.00025)
+    b_list = np.arange(best_b - 6.0, best_b + 6.0 + 1e-12, 0.1)
+
+    # only keep usable windows
+    usable = [w for w in windows if len(w["manual"]) > 0 and len(w["mp"]) > 0]
+    if len(usable) == 0:
+        return pd.DataFrame()
+
+    rows = []
+    for _ in range(int(n_boot)):
+        boot_wins = []
+        for w in usable:
+            m = w["manual"]
+            # resample manual anchors with replacement
+            idx = rng.integers(0, len(m), size=len(m))
+            boot_manual = m[idx]
+            boot_wins.append({"manual": boot_manual, "mp": w["mp"], "name": w["name"]})
+
+        # evaluate local grid around best
+        best = None
+        for a in a_list:
+            for b in b_list:
+                total = 0.0
+                total_miss = 0
+                per = {}
+                for w in boot_wins:
+                    r = greedy_match_mae(w["manual"], a * w["mp"] + b, tol=tol)
+                    if r is None:
+                        mae, miss = 10.0, len(w["manual"])
+                    else:
+                        mae, miss = r
+                    total += mae + 2.0 * miss
+                    total_miss += miss
+                    per[w["name"]] = (mae, miss)
+                if best is None or total < best["score"]:
+                    best = {"a": float(a), "b": float(b), "score": float(total), "miss": int(total_miss), "per": per}
+
+        row = {"a": best["a"], "b": best["b"], "score": best["score"], "total_miss": best["miss"]}
+        # flatten per-window
+        for k, (mae, miss) in best["per"].items():
+            row[f"mae_{k}"] = mae
+            row[f"miss_{k}"] = miss
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def bootstrap_mf_score_around_best(
+    mp_focus, t, dff, epoch, base_mask, search_mask,
+    a_mv, b_mv, dur_v, a_mf_best, b_mf_best,
+    n_boot, seed
+):
+    """
+    Bootstrap MF stability by resampling events (mp_focus) with replacement
+    and scoring a small b neighborhood around best a_mf and b_mf.
+
+    We DO NOT re-search over a (too slow). We keep a fixed a=a_mf_best
+    and let b vary locally to see if best b is stable.
+
+    Returns DataFrame with:
+      b_best, score_best, valid_ratio, med_pos, med_neg
+    """
+    rng = np.random.default_rng(seed)
+
+    b_list = np.arange(b_mf_best - 6.0, b_mf_best + 6.0 + 1e-12, 0.1)
+    rows = []
+
+    mp_focus = mp_focus.astype(float)
+    if len(mp_focus) < MF_MIN_EVENTS:
+        return pd.DataFrame()
+
+    for _ in range(int(n_boot)):
+        idx = rng.integers(0, len(mp_focus), size=len(mp_focus))
+        mp_bs = mp_focus[idx]
+
+        best = None
+        for b in b_list:
+            sc, nused, vratio, med_pos, med_neg = score_medpc_to_fiber_videogrounded(
+                a_mf_best, float(b),
+                mp_bs,
+                t, dff,
+                epoch, base_mask, search_mask,
+                a_mv, b_mv, dur_v,
+                direction="either"
+            )
+            if best is None or sc > best["score"]:
+                best = {
+                    "b": float(b),
+                    "score": float(sc),
+                    "nused": int(nused),
+                    "valid_ratio": float(vratio),
+                    "med_pos": float(med_pos) if np.isfinite(med_pos) else np.nan,
+                    "med_neg": float(med_neg) if np.isfinite(med_neg) else np.nan,
+                }
+        rows.append(best)
+
+    return pd.DataFrame(rows)
+
+
+def basic_sanity_checks(a_mv, b_mv, a_mf, b_mf, mp_s, t, dur_v):
+    """
+    Simple automatic checks. Not "tests" in the unit-test sense, but guards.
+    Returns dict of check_name -> (pass_bool, message).
+    """
+    checks = {}
+
+    # MV scale sanity
+    if 0.8 <= a_mv <= 1.2:
+        checks["mv_scale_reasonable"] = (True, f"a_mv={a_mv:.6f} within [0.8,1.2]")
+    else:
+        checks["mv_scale_reasonable"] = (False, f"a_mv={a_mv:.6f} outside [0.8,1.2]")
+
+    # MF scale sanity
+    if 0.6 <= a_mf <= 1.6:
+        checks["mf_scale_reasonable"] = (True, f"a_mf={a_mf:.6f} within [0.6,1.6]")
+    else:
+        checks["mf_scale_reasonable"] = (False, f"a_mf={a_mf:.6f} outside [0.6,1.6]")
+
+    # fiber range coverage
+    ev_fiber = a_mf * mp_s + b_mf
+    inside = (ev_fiber >= float(t.min())) & (ev_fiber <= float(t.max()))
+    frac_inside = float(np.mean(inside)) if len(ev_fiber) else 0.0
+    checks["fiber_coverage"] = (frac_inside > 0.5, f"{frac_inside*100:.1f}% of mapped events inside fiber time range")
+
+    # MV mapped range coverage to video duration (event times, not peak)
+    ev_video = a_mv * mp_s + b_mv
+    inside_v = (ev_video >= 0.0) & (ev_video <= float(dur_v))
+    frac_inside_v = float(np.mean(inside_v)) if len(ev_video) else 0.0
+    checks["video_coverage"] = (frac_inside_v > 0.5, f"{frac_inside_v*100:.1f}% of mapped event times inside video duration")
+
+    return checks
+
+
+# ============================================================
+# GLOBAL LOADS (video + fiber) ONCE
+# ============================================================
+# ---- VIDEO META (auto FPS)
+cap_tmp = cv2.VideoCapture(str(video_file))
+if not cap_tmp.isOpened():
+    raise RuntimeError("Could not open video file (codec).")
+
+fps_meta = cap_tmp.get(cv2.CAP_PROP_FPS)
+fps_v = estimate_video_fps_if_needed(cap_tmp, fps_meta)
+nframes = int(cap_tmp.get(cv2.CAP_PROP_FRAME_COUNT))
+dur_v = (nframes / fps_v) if (fps_v > 0 and nframes > 0) else float("nan")
+W = int(cap_tmp.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(cap_tmp.get(cv2.CAP_PROP_FRAME_HEIGHT))
+cap_tmp.release()
+print(f"[VIDEO META] fps={fps_v:.3f} frames={nframes} dur≈{dur_v:.1f}s size={W}x{H}")
+
+# ---- FIBER LOAD
+fdf = pd.read_csv(fiber_file)
+time_col, sig_col, ctl_col = infer_fiber_cols(fdf)
+
+t = pd.to_numeric(fdf[time_col], errors="coerce")
+sig = pd.to_numeric(fdf[sig_col], errors="coerce")
+ctl = pd.to_numeric(fdf[ctl_col], errors="coerce")
+mask = t.notna() & sig.notna() & ctl.notna()
+t = t[mask].to_numpy().astype(float)
+sig = sig[mask].to_numpy().astype(float)
+ctl = ctl[mask].to_numpy().astype(float)
+
+t, t_scale = normalize_to_seconds_by_dt(t)
+dt = float(np.nanmedian(np.diff(t)))
+if not np.isfinite(dt) or dt <= 0:
+    raise RuntimeError("Fiber timestamps look invalid (dt<=0).")
+fs = 1.0 / dt
+
+print(f"[FIBER] time={time_col} signal={sig_col} control={ctl_col} time_scale={t_scale} Fs≈{fs:.3f}Hz range={t.min():.1f}..{t.max():.1f}s")
+
+# ---- PHOTOBLEACH CORRECT
+sig_n, ctl_n, trend_sig, trend_ctl = photobleach_correct(sig, ctl, fs=fs, tau_sec=PB_TAU_SEC)
+
+# Save global photobleach plot
+global_figdir = root / "figures"
+global_figdir.mkdir(parents=True, exist_ok=True)
+pb_png_global = global_figdir / "photobleach_trends.png"
+plt.figure(figsize=(12, 5))
+plt.plot(t, sig, linewidth=0.7, label="Signal raw", alpha=0.7)
+plt.plot(t, trend_sig, linewidth=2.0, label=f"Signal EMA trend (tau={PB_TAU_SEC}s)")
+plt.plot(t, ctl, linewidth=0.7, label="Control raw", alpha=0.7)
+plt.plot(t, trend_ctl, linewidth=2.0, label=f"Control EMA trend (tau={PB_TAU_SEC}s)")
+plt.xlabel("Time (s)")
+plt.ylabel("Fluorescence (raw units)")
+plt.title("Photobleaching / drift trends (EMA)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(pb_png_global, dpi=200)
+plt.close()
+print(f"[OK] Saved: {pb_png_global}")
+
+# ---- pMAT-style OLS on PB-corrected channels => dF/F
+a_fit, b_fit = np.polyfit(ctl_n, sig_n, 1)
+fit_ctl = a_fit * ctl_n + b_fit
+dff = (sig_n - fit_ctl) / fit_ctl
+print(f"[CTL->SIG OLS on PB-corrected] a={a_fit:.6f} b={b_fit:.6f}")
+
+# peri-event time axis in fiber dt
+epoch = np.arange(-PRE, POST + dt, dt)
+base_mask = (epoch >= BASE_START) & (epoch < BASE_END)
+search_mask = (epoch >= PEAK_SEARCH_START) & (epoch <= PEAK_SEARCH_END)
+search_t = epoch[search_mask]
+
+
+# ============================================================
+# LOAD MEDPC FILE + PICK TWO CANDIDATE COLUMNS
+# ============================================================
+bdf = pd.read_csv(beh_file)
+
+# Try preferred known names first, then fallback to numeric-heavy columns
+preferred = []
+for name in ["self_administrator", "demonstrator", "demonstrator_medpc", "demo", "demonstrator_events"]:
+    if name in bdf.columns:
+        preferred.append(name)
+
+if len(preferred) < 2:
+    numeric_cols = []
+    for c in bdf.columns:
+        s = pd.to_numeric(bdf[c], errors="coerce")
+        n = int(s.notna().sum())
+        if n >= 20:
+            numeric_cols.append((c, n))
+    numeric_cols.sort(key=lambda x: x[1], reverse=True)
+    for c, _ in numeric_cols:
+        if c not in preferred:
+            preferred.append(c)
+        if len(preferred) >= 2:
+            break
+
+seen = set()
+cand_cols = []
+for c in preferred:
+    if c not in seen:
+        seen.add(c)
+        cand_cols.append(c)
+    if len(cand_cols) >= 2:
+        break
+
+if len(cand_cols) == 0:
+    raise ValueError("No usable MedPC columns found in deneme.csv.")
+if len(cand_cols) == 1:
+    print(f"[WARN] Only 1 usable MedPC column found: {cand_cols[0]}. Running only that one.")
+
+print("[MEDPC COLUMNS USED]", cand_cols)
+
+
+# ============================================================
+# MAIN PIPELINE PER MEDPC COLUMN
+# ============================================================
+def run_case(colname: str):
+    case_root = root / f"case_{colname}"
+    figdir = case_root / "figures"
+    viddir_inc = case_root / "videos_increase"
+    viddir_dec = case_root / "videos_decrease"
+    valdir = case_root / "validation"
+    figdir.mkdir(parents=True, exist_ok=True)
+    viddir_inc.mkdir(parents=True, exist_ok=True)
+    viddir_dec.mkdir(parents=True, exist_ok=True)
+    valdir.mkdir(parents=True, exist_ok=True)
+
+    # Copy photobleach plot into case folder for completeness (same underlying fiber data)
+    pb_png = figdir / "photobleach_trends.png"
+    plt.figure(figsize=(12, 5))
+    plt.plot(t, sig, linewidth=0.7, label="Signal raw", alpha=0.7)
+    plt.plot(t, trend_sig, linewidth=2.0, label=f"Signal EMA trend (tau={PB_TAU_SEC}s)")
+    plt.plot(t, ctl, linewidth=0.7, label="Control raw", alpha=0.7)
+    plt.plot(t, trend_ctl, linewidth=2.0, label=f"Control EMA trend (tau={PB_TAU_SEC}s)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Fluorescence (raw units)")
+    plt.title("Photobleaching / drift trends (EMA)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(pb_png, dpi=200)
+    plt.close()
+
+    # ----------------------------
+    # 1) MEDPC load + normalize + cluster
+    # ----------------------------
+    mp_raw = pd.to_numeric(bdf[colname], errors="coerce").dropna().to_numpy()
+    mp_raw = mp_raw[mp_raw > 0].astype(float)
+    mp_raw = np.sort(mp_raw)
+
+    mp_s, mp_scale = normalize_to_seconds_by_dt(mp_raw)
+    mp_s = mp_s - float(np.min(mp_s)) if len(mp_s) else mp_s
+    mp_s = cluster_events(mp_s, CLUSTER_WIN)
+
+    mp_idx = np.arange(1, len(mp_s) + 1, dtype=int)
+
+    print(f"\n=== CASE: {colname} ===")
+    print(f"[OK] MedPC clustered events: n={len(mp_s)} scale={mp_scale} range={mp_s.min():.1f}..{mp_s.max():.1f}s")
+
+    # Windowed MedPC subsets that correspond to your manual windows
+    mp_0_10   = mp_s[(mp_s >= 0) & (mp_s <= 600)]
+    mp_mid    = mp_s[(mp_s >= MID_WIN_START_S) & (mp_s <= MID_WIN_END_S)]
+    mp_35_45  = mp_s[(mp_s >= 35 * 60) & (mp_s <= 45 * 60)]
+
+    print(f"[OK] MedPC windows: 0-10min n={len(mp_0_10)} | mid(10-35) n={len(mp_mid)} | 35-45min n={len(mp_35_45)}")
+    print(f"[OK] Manual anchors: 0-10 n={len(manual_0_10)} | mid n={len(manual_mid)} | 35-45 n={len(manual_35_45)}")
+
+    # ----------------------------
+    # 2) MedPC -> Video alignment using THREE manual windows
+    # ----------------------------
+    mv_windows = [
+        {"name": "w0_10",  "manual": manual_0_10,  "mp": mp_0_10},
+        {"name": "wmid",   "manual": manual_mid,   "mp": mp_mid},
+        {"name": "w35_45", "manual": manual_35_45, "mp": mp_35_45},
+    ]
+    mv = best_affine_medpc_to_video_multi(mv_windows, tol=TOL_MANUAL)
+    a_mv, b_mv = float(mv["a"]), float(mv["b"])
+
+    # Compute per-window MAE/misses at best
+    mv_per = {name: (mae, miss) for (name, mae, miss) in mv["per"]}
+    print(f"[ALIGN MV] t_video = {a_mv:.6f}*t_medpc + {b_mv:.3f}  total_score={mv['score']:.2f}")
+    for nm in ["w0_10", "wmid", "w35_45"]:
+        if nm in mv_per:
+            mae, miss = mv_per[nm]
+            print(f"          [{nm}] MAE={mae:.2f}s miss={miss}")
+
+    # ----------------------------
+    # 3) MedPC -> Fiber alignment (grid + fine b), VIDEO-GROUNDED, direction='either'
+    # ----------------------------
+    dur_mp = float(np.max(mp_s)) if len(mp_s) else 1.0
+    dur_f = float(np.max(t))
+    a0 = dur_f / dur_mp
+
+    a_list = np.arange(max(0.8, a0 - A_MF_PAD), min(1.2, a0 + A_MF_PAD) + 1e-12, A_MF_STEP_COARSE)
+    b_list = np.arange(B_MF_MIN, B_MF_MAX + 1e-12, B_MF_STEP_COARSE)
+
+    # Focus events in windows where we have manual anchors (makes alignment more stable)
+    mp_focus = np.concatenate([mp_0_10, mp_mid, mp_35_45]) if (len(mp_0_10) + len(mp_mid) + len(mp_35_45)) > 0 else mp_s
+
+    # Subsample deterministically for coarse
+    if len(mp_focus) > MF_COARSE_MAX_EVENTS:
+        stride = int(np.ceil(len(mp_focus) / MF_COARSE_MAX_EVENTS))
+        mp_focus_coarse = mp_focus[::stride]
+    else:
+        mp_focus_coarse = mp_focus
+
+    best_mf = None
+    for a in a_list:
+        for b in b_list:
+            sc, nused, vratio, med_pos, med_neg = score_medpc_to_fiber_videogrounded(
+                float(a), float(b),
+                mp_focus_coarse,
+                t, dff,
+                epoch, base_mask, search_mask,
+                a_mv, b_mv, dur_v,
+                direction="either"
+            )
+            if best_mf is None or sc > best_mf["score"]:
+                best_mf = {
+                    "a": float(a),
+                    "b": float(b),
+                    "score": float(sc),
+                    "nused": int(nused),
+                    "valid_ratio": float(vratio),
+                    "med_pos": float(med_pos) if np.isfinite(med_pos) else np.nan,
+                    "med_neg": float(med_neg) if np.isfinite(med_neg) else np.nan,
+                }
+
+    if best_mf is None or best_mf["score"] < -1e8:
+        raise RuntimeError("Failed to find MedPC->Fiber alignment (coarse).")
+
+    # Fine b around coarse best using FULL mp_focus
+    a_mf = best_mf["a"]
+    b0 = best_mf["b"]
+    b_list2 = np.arange(b0 - 3.0, b0 + 3.0 + 1e-12, B_MF_STEP_FINE)
+
+    best2 = None
+    for b in b_list2:
+        sc, nused, vratio, med_pos, med_neg = score_medpc_to_fiber_videogrounded(
+            a_mf, float(b),
+            mp_focus,
+            t, dff,
+            epoch, base_mask, search_mask,
+            a_mv, b_mv, dur_v,
+            direction="either"
+        )
+        if best2 is None or sc > best2["score"]:
+            best2 = {
+                "a": float(a_mf),
+                "b": float(b),
+                "score": float(sc),
+                "nused": int(nused),
+                "valid_ratio": float(vratio),
+                "med_pos": float(med_pos) if np.isfinite(med_pos) else np.nan,
+                "med_neg": float(med_neg) if np.isfinite(med_neg) else np.nan,
+            }
+
+    a_mf, b_mf = best2["a"], best2["b"]
+    print(f"[ALIGN MF VIDEO-GROUNDED] t_fiber = {a_mf:.6f}*t_medpc + {b_mf:.3f} "
+          f"(score={best2['score']:.3f}, nused={best2['nused']}, valid_ratio={best2['valid_ratio']:.2f})")
+
+    # ----------------------------
+    # 4) Peri-event for ALL events: compute BOTH increase and decrease
+    # ----------------------------
+    ev_fiber_all = a_mf * mp_s + b_mf
+    ok_fiber = (ev_fiber_all - PRE >= t.min()) & (ev_fiber_all + POST <= t.max())
+
+    mp_ok = mp_s[ok_fiber]
+    mp_ok_idx = mp_idx[ok_fiber]
+    ev_fiber = ev_fiber_all[ok_fiber]
+
+    print(f"[OK] Events usable in fiber: n={len(ev_fiber)}")
+
+    rz_trials = []
+    peak_pos_z = []
+    peak_pos_off = []
+    peak_neg_z = []
+    peak_neg_off = []
+
+    for e in ev_fiber:
+        tr = np.interp(e + epoch, t, dff)
+        rz = robust_z(tr, base_mask)
+        zz = rz[search_mask]
+
+        if np.all(np.isnan(zz)):
+            rz_trials.append(rz)
+            peak_pos_z.append(np.nan); peak_pos_off.append(np.nan)
+            peak_neg_z.append(np.nan); peak_neg_off.append(np.nan)
+            continue
+
+        kmax = int(np.nanargmax(zz))
+        kmin = int(np.nanargmin(zz))
+
+        rz_trials.append(rz)
+        peak_pos_z.append(float(zz[kmax]))
+        peak_pos_off.append(float(search_t[kmax]))
+
+        peak_neg_z.append(float(zz[kmin]))          # negative (usually)
+        peak_neg_off.append(float(search_t[kmin]))
+
+    rz_trials = np.vstack(rz_trials) if len(rz_trials) else np.zeros((0, len(epoch)))
+    peak_pos_z = np.array(peak_pos_z, dtype=float)
+    peak_pos_off = np.array(peak_pos_off, dtype=float)
+    peak_neg_z = np.array(peak_neg_z, dtype=float)
+    peak_neg_off = np.array(peak_neg_off, dtype=float)
+
+    # ----------------------------
+    # 5) Video times for BOTH pos and neg peaks
+    # ----------------------------
+    t_video_event_all = a_mv * mp_ok + b_mv
+    t_video_peak_pos = t_video_event_all + (a_mv / a_mf) * peak_pos_off
+    t_video_peak_neg = t_video_event_all + (a_mv / a_mf) * peak_neg_off
+
+    ok_video_pos = (t_video_peak_pos - CLIP_PRE >= 0) & (t_video_peak_pos + CLIP_POST <= dur_v) & np.isfinite(t_video_peak_pos)
+    ok_video_neg = (t_video_peak_neg - CLIP_PRE >= 0) & (t_video_peak_neg + CLIP_POST <= dur_v) & np.isfinite(t_video_peak_neg)
+
+    print(f"[OK] Events usable in video (increase-peaks, 5+5s): n={int(np.sum(ok_video_pos))}")
+    print(f"[OK] Events usable in video (decrease-peaks, 5+5s): n={int(np.sum(ok_video_neg))}")
+
+    # Full event table
+    all_events_df = pd.DataFrame({
+        "nosepoke_index": mp_ok_idx.astype(int),
+        "t_medpc_s": mp_ok.astype(float),
+        "t_fiber_event_s": ev_fiber.astype(float),
+
+        "peak_pos_robust_z": peak_pos_z.astype(float),
+        "peak_pos_offset_fiber_s": peak_pos_off.astype(float),
+        "t_video_peak_pos_s": t_video_peak_pos.astype(float),
+        "usable_in_video_pos": ok_video_pos.astype(bool),
+
+        "peak_neg_robust_z": peak_neg_z.astype(float),
+        "peak_neg_offset_fiber_s": peak_neg_off.astype(float),
+        "t_video_peak_neg_s": t_video_peak_neg.astype(float),
+        "usable_in_video_neg": ok_video_neg.astype(bool),
+
+        "t_video_event_s": t_video_event_all.astype(float),
+    })
+    all_events_csv = case_root / "all_aligned_events.csv"
+    all_events_df.to_csv(all_events_csv, index=False)
+    print(f"[OK] Saved: {all_events_csv}")
+
+    # ----------------------------
+    # 6) Select TOP events (with refractory) for INCREASE and DECREASE separately
+    # ----------------------------
+    def choose_top_indices(scores: np.ndarray, mp_times: np.ndarray, refractory: float, max_keep: int = 200, descending: bool = True):
+        # descending=True: pick large scores first
+        key = -np.nan_to_num(scores, nan=-1e9) if descending else np.nan_to_num(scores, nan=1e9)
+        order = np.argsort(key)
+        chosen = []
+        used_mp = []
+        for idx0 in order:
+            t_mp = float(mp_times[idx0])
+            if any(abs(t_mp - u) < refractory for u in used_mp):
+                continue
+            chosen.append(int(idx0))
+            used_mp.append(t_mp)
+            if len(chosen) >= max_keep:
+                break
+        return np.array(chosen, dtype=int)
+
+    # INCREASE: maximize peak_pos_z
+    chosen_inc = choose_top_indices(peak_pos_z, mp_ok, EVENT_REFRACTORY, max_keep=200, descending=True)
+    valid_inc = []
+    for idx0 in chosen_inc:
+        if not ok_video_pos[idx0]:
+            continue
+        valid_inc.append((idx0, float(t_video_peak_pos[idx0]), float(t_video_event_all[idx0])))
+        if len(valid_inc) >= TARGET_CLIPS:
+            break
+    print(f"[OK] Valid INCREASE clips: n={len(valid_inc)} (target={TARGET_CLIPS})")
+
+    # DECREASE: maximize magnitude of decrease => maximize (-peak_neg_z)
+    dec_score = -peak_neg_z
+    chosen_dec = choose_top_indices(dec_score, mp_ok, EVENT_REFRACTORY, max_keep=200, descending=True)
+    valid_dec = []
+    for idx0 in chosen_dec:
+        if not ok_video_neg[idx0]:
+            continue
+        valid_dec.append((idx0, float(t_video_peak_neg[idx0]), float(t_video_event_all[idx0])))
+        if len(valid_dec) >= TARGET_CLIPS:
+            break
+    print(f"[OK] Valid DECREASE clips: n={len(valid_dec)} (target={TARGET_CLIPS})")
+
+    # ----------------------------
+    # 7) TOP10 summaries + debug vs manual (increase & decrease)
+    # ----------------------------
+    def write_top10_tables(valid_list, mode: str):
+        summary = []
+        debug_rows = []
+        for rank, (idx0, tpkv, tev) in enumerate(valid_list, start=1):
+            np_index = int(mp_ok_idx[idx0])
+            t_medpc = float(mp_ok[idx0])
+
+            # nearest manual anchor distance to event time (not peak time)
+            dman = nearest_dist_mean(np.array([tev]), manual_all)
+
+            if mode == "increase":
+                zpk = float(peak_pos_z[idx0])
+                pkoff = float(peak_pos_off[idx0])
+                t_peak = float(t_video_peak_pos[idx0])
+            else:
+                zpk = float(peak_neg_z[idx0])   # negative
+                pkoff = float(peak_neg_off[idx0])
+                t_peak = float(t_video_peak_neg[idx0])
+
+            summary.append({
+                "rank": rank,
+                "mode": mode,
+                "nosepoke_index": np_index,
+                "t_medpc_s": t_medpc,
+                "t_fiber_event_s": float(ev_fiber[idx0]),
+                "peak_robust_z": zpk,
+                "peak_offset_fiber_s": pkoff,
+                "t_video_event_s": float(tev),
+                "t_video_peak_s": t_peak,
+                "nearest_manual_dt_s": float(dman),
+            })
+
+            debug_rows.append({
+                "rank": rank,
+                "mode": mode,
+                "nosepoke_index": np_index,
+                "t_video_event_s": float(tev),
+                "nearest_manual_dt_s": float(dman),
+                "t_video_peak_s": t_peak,
+                "peak_offset_fiber_s": pkoff,
+                "peak_robust_z": zpk,
+                "a_mv": a_mv, "b_mv": b_mv,
+                "a_mf": a_mf, "b_mf": b_mf,
+                "fiber_fs_hz": float(fs),
+                "video_fps": float(fps_v),
+                "pb_tau_sec": float(PB_TAU_SEC),
+                "medpc_column": colname,
+            })
+
+        summary_df = pd.DataFrame(summary)
+        debug_df = pd.DataFrame(debug_rows)
+
+        summary_csv = case_root / f"top10_np1_summary_{mode}.csv"
+        debug_csv = case_root / f"top10_debug_vs_manual_{mode}.csv"
+        summary_df.to_csv(summary_csv, index=False)
+        debug_df.to_csv(debug_csv, index=False)
+        print(f"[OK] Saved: {summary_csv}")
+        print(f"[OK] Saved: {debug_csv}")
+
+    write_top10_tables(valid_inc, "increase")
+    write_top10_tables(valid_dec, "decrease")
+
+    # ----------------------------
+    # 8) TOP10 peri-event grid plots (increase & decrease)
+    # ----------------------------
+    def save_grid(valid_list, mode: str):
+        out_png = figdir / f"top10_peri_event_robustZ_grid_{mode}.png"
+        if len(valid_list) == 0:
+            return
+        plt.figure(figsize=(18, 6))
+        ncols = 5
+        nrows = int(np.ceil(len(valid_list) / ncols))
+        for j, (idx0, _, _) in enumerate(valid_list, start=1):
+            ax = plt.subplot(nrows, ncols, j)
+            ax.plot(epoch, rz_trials[idx0], linewidth=1)
+            ax.axvline(0, linestyle="--", linewidth=1)
+
+            if mode == "increase":
+                ax.axvline(peak_pos_off[idx0], linestyle=":", linewidth=1)
+                ztxt = peak_pos_z[idx0]
+                off = peak_pos_off[idx0]
+            else:
+                ax.axvline(peak_neg_off[idx0], linestyle=":", linewidth=1)
+                ztxt = peak_neg_z[idx0]
+                off = peak_neg_off[idx0]
+
+            ax.set_title(f"{mode.upper()} #{j} | Z={ztxt:.2f} | NP#{int(mp_ok_idx[idx0])} | off={off:.2f}s")
+            ax.set_xlabel("Time (s) relative to nosepoke")
+            ax.set_ylabel("Robust Z (dF/F)")
+            ax.set_xlim(-PRE, POST)
+
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200)
+        plt.close()
+        print(f"[OK] Saved: {out_png}")
+
+    save_grid(valid_inc, "increase")
+    save_grid(valid_dec, "decrease")
+
+    # ----------------------------
+    # 9) ALL EVENTS mean peri-event + AUC
+    # ----------------------------
+    finite_rows = np.all(np.isfinite(rz_trials), axis=1)
+    rz_valid = rz_trials[finite_rows]
+
+    if rz_valid.shape[0] >= 5:
+        mean_rz = np.nanmean(rz_valid, axis=0)
+        sem_rz = np.nanstd(rz_valid, axis=0, ddof=1) / np.sqrt(rz_valid.shape[0])
+
+        auc_net_0_3 = auc_trapz(mean_rz, epoch, 0.0, 3.0)
+        auc_net_0_5 = auc_trapz(mean_rz, epoch, 0.0, 5.0)
+
+        mean_pos = np.where(mean_rz > 0, mean_rz, 0.0)
+        mean_neg = np.where(mean_rz < 0, mean_rz, 0.0)
+        auc_pos_0_3 = auc_trapz(mean_pos, epoch, 0.0, 3.0)
+        auc_pos_0_5 = auc_trapz(mean_pos, epoch, 0.0, 5.0)
+        auc_neg_0_3 = auc_trapz(mean_neg, epoch, 0.0, 3.0)  # negative value
+        auc_neg_0_5 = auc_trapz(mean_neg, epoch, 0.0, 5.0)  # negative value
+
+        auc_df = pd.DataFrame([{
+            "medpc_column": colname,
+            "n_events_used": int(rz_valid.shape[0]),
+            "AUC_net_mean_trace_0_3s": auc_net_0_3,
+            "AUC_net_mean_trace_0_5s": auc_net_0_5,
+            "AUC_pos_mean_trace_0_3s": auc_pos_0_3,
+            "AUC_pos_mean_trace_0_5s": auc_pos_0_5,
+            "AUC_neg_mean_trace_0_3s": auc_neg_0_3,
+            "AUC_neg_mean_trace_0_5s": auc_neg_0_5,
+        }])
+        auc_csv = case_root / "all_events_mean_trace_auc.csv"
+        auc_df.to_csv(auc_csv, index=False)
+        print(f"[OK] Saved: {auc_csv}")
+
+        avg_png = figdir / "all_events_mean_peri_event_robustZ.png"
+        plt.figure(figsize=(10, 5))
+        plt.plot(epoch, mean_rz, linewidth=2, label="Mean Robust Z")
+        plt.fill_between(epoch, mean_rz - sem_rz, mean_rz + sem_rz, alpha=0.25, label="SEM")
+        plt.axvline(0, linestyle="--", linewidth=1)
+        plt.xlim(-PRE, POST)
+        plt.xlabel("Time (s) relative to nosepoke")
+        plt.ylabel("Robust Z (dF/F)")
+        plt.title(
+            f"All aligned nosepokes (n={rz_valid.shape[0]}) | "
+            f"NetAUC(0-3)={auc_net_0_3:.3f} NetAUC(0-5)={auc_net_0_5:.3f}"
+        )
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(avg_png, dpi=200)
+        plt.close()
+        print(f"[OK] Saved: {avg_png}")
+    else:
+        print("[WARN] Not enough finite peri-event trials for mean/SEM and AUC.")
+
+    # ----------------------------
+    # 10) Write clips for INCREASE and DECREASE
+    # ----------------------------
+    def write_clips(valid_list, mode: str, out_dir: Path):
+        cap = cv2.VideoCapture(str(video_file))
+        if not cap.isOpened():
+            raise RuntimeError("Could not open video file (codec).")
+
+        fps_meta2 = cap.get(cv2.CAP_PROP_FPS)
+        fps_use = estimate_video_fps_if_needed(cap, fps_meta2)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        for rank, (idx0, tpkv, _) in enumerate(valid_list, start=1):
+            start_t = tpkv - CLIP_PRE
+            end_t = tpkv + CLIP_POST
+            start_fr = int(round(start_t * fps_use))
+            end_fr = int(round(end_t * fps_use))
+
+            out_clip = out_dir / f"{rank}.mp4"
+            writer = cv2.VideoWriter(str(out_clip), fourcc, fps_use, (W, H))
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_fr)
+            cur = start_fr
+
+            np_index = int(mp_ok_idx[idx0])
+            t_medpc = float(mp_ok[idx0])
+
+            if mode == "increase":
+                zpk = float(peak_pos_z[idx0])
+                pkoff = float(peak_pos_off[idx0])
+                t_vid_peak = float(t_video_peak_pos[idx0])
+            else:
+                zpk = float(peak_neg_z[idx0])  # negative
+                pkoff = float(peak_neg_off[idx0])
+                t_vid_peak = float(t_video_peak_neg[idx0])
+
+            while cur <= end_fr:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                line1 = f"{colname} | {mode.upper()} | Clip {rank} | PeakZ={zpk:.2f} | VideoPeak={t_vid_peak:.2f}s"
+                line2 = f"MedPC={t_medpc:.2f}s | NosepokeIndex={np_index} | PeakOffsetFiber={pkoff:.2f}s"
+                line3 = f"PBcorr EMA tau={PB_TAU_SEC:.0f}s | FiberFs={fs:.2f}Hz | VideoFPS={fps_use:.2f}"
+
+                cv2.putText(frame, line1, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, line2, (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(frame, line3, (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+                writer.write(frame)
+                cur += 1
+
+            writer.release()
+            print(f"[OK] Clip saved: {out_clip} (5s before + 5s after)")
+
+        cap.release()
+
+    write_clips(valid_inc, "increase", viddir_inc)
+    write_clips(valid_dec, "decrease", viddir_dec)
+
+    # ----------------------------
+    # 11) Validation harness outputs (bootstrap + checks)
+    # ----------------------------
+    # MV bootstrap (stability of a_mv,b_mv)
+    mv_boot = bootstrap_mv(
+        mv_windows, best_a=a_mv, best_b=b_mv, tol=TOL_MANUAL,
+        n_boot=BOOTSTRAP_MV_N, seed=BOOTSTRAP_SEED
+    )
+    mv_boot_csv = valdir / "bootstrap_mv.csv"
+    mv_boot.to_csv(mv_boot_csv, index=False)
+    print(f"[OK] Saved: {mv_boot_csv}")
+
+    # MF bootstrap (stability of best b around chosen mapping, resampling events)
+    mf_boot = bootstrap_mf_score_around_best(
+        mp_focus=mp_focus,
+        t=t, dff=dff,
+        epoch=epoch, base_mask=base_mask, search_mask=search_mask,
+        a_mv=a_mv, b_mv=b_mv, dur_v=dur_v,
+        a_mf_best=a_mf, b_mf_best=b_mf,
+        n_boot=BOOTSTRAP_MF_N, seed=BOOTSTRAP_SEED + 77
+    )
+    mf_boot_csv = valdir / "bootstrap_mf.csv"
+    mf_boot.to_csv(mf_boot_csv, index=False)
+    print(f"[OK] Saved: {mf_boot_csv}")
+
+    # Basic sanity checks
+    checks = basic_sanity_checks(a_mv, b_mv, a_mf, b_mf, mp_s, t, dur_v)
+
+    # Summarize bootstrap distributions (robustly)
+    def qstats(x):
+        x = np.array(x, float)
+        x = x[np.isfinite(x)]
+        if len(x) == 0:
+            return (np.nan, np.nan, np.nan, np.nan)
+        return (float(np.median(x)), float(np.quantile(x, 0.16)), float(np.quantile(x, 0.84)), float(np.std(x)))
+
+    mv_a_med, mv_a_q16, mv_a_q84, mv_a_sd = qstats(mv_boot["a"]) if len(mv_boot) else (np.nan, np.nan, np.nan, np.nan)
+    mv_b_med, mv_b_q16, mv_b_q84, mv_b_sd = qstats(mv_boot["b"]) if len(mv_boot) else (np.nan, np.nan, np.nan, np.nan)
+    mf_b_med, mf_b_q16, mf_b_q84, mf_b_sd = qstats(mf_boot["b"]) if len(mf_boot) else (np.nan, np.nan, np.nan, np.nan)
+    mf_sc_med, mf_sc_q16, mf_sc_q84, mf_sc_sd = qstats(mf_boot["score"]) if len(mf_boot) else (np.nan, np.nan, np.nan, np.nan)
+
+    # Write validation report
+    val_rep = valdir / "validation_report.txt"
+    with open(val_rep, "w", encoding="utf-8") as f:
+        f.write("VALIDATION REPORT\n")
+        f.write(f"Case: {colname}\n\n")
+
+        f.write("Manual anchor windows used for MV alignment:\n")
+        f.write(f"  0-10 min anchors: {manual_0_10_txt}\n")
+        f.write(f"  MID anchors:      {manual_mid_txt}\n")
+        f.write(f"  35-45 min anchors:{manual_35_45_txt}\n\n")
+
+        f.write("Best mappings:\n")
+        f.write(f"  MV: t_video = {a_mv:.9f} * t_medpc + {b_mv:.6f}\n")
+        f.write(f"  MF: t_fiber = {a_mf:.9f} * t_medpc + {b_mf:.6f}\n\n")
+
+        f.write("MV per-window errors (at best a,b):\n")
+        for nm in ["w0_10", "wmid", "w35_45"]:
+            if nm in mv_per:
+                mae, miss = mv_per[nm]
+                f.write(f"  {nm}: MAE={mae:.3f}s miss={miss}\n")
+        f.write("\n")
+
+        f.write("MV bootstrap (local neighborhood) summary:\n")
+        f.write(f"  a_mv median={mv_a_med:.9f}  q16={mv_a_q16:.9f}  q84={mv_a_q84:.9f}  sd={mv_a_sd:.9f}\n")
+        f.write(f"  b_mv median={mv_b_med:.6f}  q16={mv_b_q16:.6f}  q84={mv_b_q84:.6f}  sd={mv_b_sd:.6f}\n")
+        f.write(f"  saved: {mv_boot_csv}\n\n")
+
+        f.write("MF bootstrap (resample events; optimize local b) summary:\n")
+        f.write(f"  b_mf median={mf_b_med:.6f}  q16={mf_b_q16:.6f}  q84={mf_b_q84:.6f}  sd={mf_b_sd:.6f}\n")
+        f.write(f"  score median={mf_sc_med:.3f} q16={mf_sc_q16:.3f} q84={mf_sc_q84:.3f} sd={mf_sc_sd:.3f}\n")
+        f.write(f"  saved: {mf_boot_csv}\n\n")
+
+        f.write("Automatic sanity checks:\n")
+        for k, (ok, msg) in checks.items():
+            f.write(f"  [{ 'PASS' if ok else 'FAIL' }] {k}: {msg}\n")
+        f.write("\n")
+
+        f.write("Interpretation note:\n")
+        f.write("  - If DECREASE clips (strong negative Z in 0-3s) look more behavior-linked than INCREASE,\n")
+        f.write("    your 'nosepoke response' might be a suppression (dip) rather than an activation.\n")
+
+    print(f"[OK] Saved: {val_rep}")
+
+    # ----------------------------
+    # 12) Alignment report (case-specific, expanded)
+    # ----------------------------
+    rep = figdir / "alignment_report.txt"
+    with open(rep, "w", encoding="utf-8") as f:
+        f.write("TIME MAPPINGS\n")
+        f.write(f"MedPC column: {colname}\n")
+        f.write(f"MedPC time scale applied: {mp_scale}\n")
+        f.write(f"Fiber time scale applied: {t_scale}\n")
+        f.write(f"Fiber Fs inferred from timestamps: {fs:.6f} Hz\n")
+        f.write(f"Video FPS inferred: {fps_v:.6f}\n\n")
+
+        f.write("MedPC -> Video (multi-window manual anchor brute-force):\n")
+        f.write("  t_video = a_mv * t_medpc + b_mv\n")
+        f.write(f"  a_mv = {a_mv:.9f}\n")
+        f.write(f"  b_mv = {b_mv:.6f}\n")
+        f.write("  Manual windows:\n")
+        f.write(f"    w0_10  anchors={len(manual_0_10)}  MedPC events in window={len(mp_0_10)}\n")
+        f.write(f"    wmid   anchors={len(manual_mid)}   MedPC events in window={len(mp_mid)}\n")
+        f.write(f"    w35_45 anchors={len(manual_35_45)} MedPC events in window={len(mp_35_45)}\n")
+        for nm in ["w0_10", "wmid", "w35_45"]:
+            if nm in mv_per:
+                mae, miss = mv_per[nm]
+                f.write(f"    {nm}: MAE={mae:.3f}s miss={miss}\n")
+        f.write("\n")
+
+        f.write("MedPC -> Fiber (grid + fine b, VIDEO-GROUNDED score):\n")
+        f.write("  t_fiber = a_mf * t_medpc + b_mf\n")
+        f.write(f"  a_mf = {a_mf:.9f}\n")
+        f.write(f"  b_mf = {b_mf:.6f}\n")
+        f.write(f"  MF_ALPHA_VALID={MF_ALPHA_VALID}, MF_B_STABIL={MF_B_STABIL}\n")
+        f.write(f"  coarse_max_events={MF_COARSE_MAX_EVENTS}\n\n")
+
+        f.write("Photobleaching correction:\n")
+        f.write("  trend = EMA(raw, tau=PB_TAU_SEC)\n")
+        f.write("  signal_n = signal / trend_signal\n")
+        f.write("  control_n = control / trend_control\n")
+        f.write(f"  PB_TAU_SEC = {PB_TAU_SEC}\n\n")
+
+        f.write("Processing (pMAT-style core):\n")
+        f.write("  fitted_control = a * control_n + b (OLS)\n")
+        f.write("  dF/F = (signal_n - fitted_control) / fitted_control\n")
+        f.write("  Robust Z = (dF/F - median(baseline)) / MAD(baseline)\n")
+        f.write(f"  Peri-event window: [-{PRE}, +{POST}] s\n")
+        f.write(f"  Baseline window: [{BASE_START}, {BASE_END}) s\n")
+        f.write(f"  Response search window: [{PEAK_SEARCH_START}, {PEAK_SEARCH_END}] s\n\n")
+
+        f.write("Increase/Decrease metrics:\n")
+        f.write("  peak_pos_robust_z = max RobustZ within response window\n")
+        f.write("  peak_neg_robust_z = min RobustZ within response window (typically negative)\n")
+        f.write("  DECREASE strength = -peak_neg_robust_z (positive magnitude)\n")
+    print(f"[OK] Saved: {rep}")
+
+    print(f"[DONE] Case outputs: {case_root}")
+
+
+# Run all candidate columns
+for c in cand_cols:
+    run_case(c)
+
+print("\n[ALL DONE] Root:", root)
