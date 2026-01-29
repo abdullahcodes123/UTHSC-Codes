@@ -1,0 +1,1071 @@
+# -*- coding: utf-8 -*-
+"""
+MASTER clock alignment pipeline (ENGLISH)
+
+Key rule:
+  - Video + Fiber DEFINE the MASTER clock (after the same TRIM).
+  - MedPC is aligned AFTERWARDS to MASTER using a ONE-WAY affine transform:
+        MASTER_time ≈ a * MedPC_time + b
+  - Video is NEVER warped to MedPC.
+  - Fiber is NEVER warped to MedPC.
+
+Extras you asked for:
+  1) Leave-one-anchor-out (LOO) robustness:
+     - We try dropping each manual anchor (one at a time),
+       run monotonic DP matching + affine fit on the remaining anchors,
+       score the solution, and pick the best scenario.
+     - The "best" scenario determines which first element (anchor) is excluded.
+
+  2) Tiny progress bar (console) + partial results printed to screen:
+     - We print a NEAREST-candidates table similar to your example.
+     - We print the chosen dropped anchor (if any), affine (a,b), match stats, and AUC stats.
+
+Outputs (in root/outputs):
+  - alignment_report.csv              : matched anchors ↔ MedPC events (+ self_administrator)
+  - medpc_events_master.csv           : all MedPC events with MASTER times
+  - selected_clips_manifest.csv       : clip list (ranked by peak Z)
+  - fiber_master.parquet / csv        : prepared fiber on MASTER axis
+  - peri_event_summary.npz            : mean/SEM/AUC etc.
+  - bootstrap_affine_ab.csv           : bootstrap distribution of (a,b) (if enough matches)
+  - run_meta.json                     : run metadata including dropped anchor
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import random
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import cv2  # type: ignore
+except Exception:
+    cv2 = None
+
+
+# -----------------------------
+# User paths
+# -----------------------------
+desktop = Path("/content/drive/MyDrive/deneme")
+beh_file   = desktop / "deneme.csv"
+fiber_file = desktop / "fiber.csv"
+video_file = desktop / "Abdullah.avi"
+
+root = desktop / "abdullah_deneme"
+root.mkdir(parents=True, exist_ok=True)
+(out_dir := root / "outputs").mkdir(parents=True, exist_ok=True)
+(clips_dir := out_dir / "selected_clips").mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# Clocks provided by you
+# -----------------------------
+MEDPC_START_CLOCK = "15:43:47"
+FIBER_VIDEO_START_CLOCK = "15:44:43"
+
+# Manual video anchors (MASTER seconds, after trimming and starting at 0)
+MANUAL_VIDEO_ANCHORS_MASTER_SEC = np.array([
+     96, 172, 214, 263, 319, 409, 420, 472, 505, 590,
+    747, 799, 1273, 1643, 1916,
+    2170, 2295, 2581, 2591
+], dtype=float)
+
+
+# -----------------------------
+# Parameters
+# -----------------------------
+TRIM_START_SEC = 0.0
+
+# Fiber peri-event
+PRE_SEC  = 5.0
+POST_SEC = 10.0
+BASELINE_WIN_SEC = 5.0
+REFRACTORY_SEC = 1.0
+
+# Clip selection
+TARGET_CLIPS = 20
+CLIP_PRE_SEC = 3.0
+CLIP_POST_SEC = 5.0
+
+# Matching tolerances
+MAX_ABS_TIME_ERR_SEC = 15.0
+MAX_INTERVAL_REL_ERR = 0.25
+
+# Leave-one-out (anchor removal) scoring
+LOO_ENABLE = True
+LOO_ALLOW_DROP_NONE = True  # include scenario "drop nothing"
+LOO_PENALTY_FOR_FEWER_MATCHES = 10.0  # bigger => prefers matching more anchors
+
+# Bootstrap
+BOOTSTRAP_N = 200
+BOOTSTRAP_FRAC = 0.75
+RANDOM_SEED = 7
+
+
+# ============================================================
+# Small console progress bar
+# ============================================================
+def pbar(step: int, total: int, msg: str) -> None:
+    width = 28
+    step = max(0, min(step, total))
+    filled = int(round(width * step / max(1, total)))
+    bar = "█" * filled + "·" * (width - filled)
+    print(f"[{bar}] {step:>2}/{total:<2}  {msg}")
+
+def safe_run(cmd: List[str]) -> Tuple[int, str, str]:
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+# ============================================================
+# Time / stats helpers
+# ============================================================
+def parse_hhmmss_to_seconds(hhmmss: str) -> int:
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2}):(\d{2})\s*", hhmmss)
+    if not m:
+        raise ValueError(f"Bad clock string: {hhmmss!r} (expected HH:MM:SS)")
+    h, mi, s = map(int, m.groups())
+    return h * 3600 + mi * 60 + s
+
+def clock_offset_seconds(medpc_start: str, fiber_video_start: str) -> float:
+    medpc = parse_hhmmss_to_seconds(medpc_start)
+    fv = parse_hhmmss_to_seconds(fiber_video_start)
+    return float(medpc - fv)
+
+def ensure_monotonic_increasing(t: np.ndarray, name: str) -> None:
+    if np.any(np.diff(t) < 0):
+        raise ValueError(f"{name} must be monotonic nondecreasing.")
+
+def robust_median_mad(x: np.ndarray) -> Tuple[float, float]:
+    med = float(np.nanmedian(x))
+    mad = float(np.nanmedian(np.abs(x - med)))
+    if mad <= 1e-12:
+        mad = 1e-12
+    return med, mad
+
+def ema_trend(x: np.ndarray, alpha: float) -> np.ndarray:
+    y = np.empty_like(x, dtype=float)
+    prev = float(x[0])
+    y[0] = prev
+    for i in range(1, len(x)):
+        prev = alpha * float(x[i]) + (1 - alpha) * prev
+        y[i] = prev
+    return y
+
+def linear_fit_affine(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    A = np.vstack([x, np.ones_like(x)]).T
+    a, b = np.linalg.lstsq(A, y, rcond=None)[0]
+    return float(a), float(b)
+
+def detect_time_unit_and_to_seconds(t: np.ndarray) -> np.ndarray:
+    t = np.asarray(t, float)
+    mx = float(np.nanmax(t))
+    if mx > 1e7:   # likely microseconds
+        return t / 1e6
+    if mx > 1e4:   # likely milliseconds
+        return t / 1e3
+    return t
+
+
+# ============================================================
+# Video VFR-safe frame timeline
+# ============================================================
+def get_video_pts_ffprobe(video_path: Path) -> Optional[np.ndarray]:
+    if shutil.which("ffprobe") is None:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "frame=pkt_pts_time,best_effort_timestamp_time",
+        "-of", "json",
+        str(video_path)
+    ]
+    rc, out, _ = safe_run(cmd)
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+        frames = data.get("frames", [])
+        pts = []
+        for fr in frames:
+            v = fr.get("best_effort_timestamp_time", None)
+            if v is None:
+                v = fr.get("pkt_pts_time", None)
+            pts.append(np.nan if v is None else float(v))
+        pts = np.asarray(pts, dtype=float)
+        pts = pts[~np.isnan(pts)]
+        if len(pts) < 10:
+            return None
+        pts = pts - pts[0]
+        if np.any(np.diff(pts) < -1e-6):
+            return None
+        return pts
+    except Exception:
+        return None
+
+def get_video_pts_opencv(video_path: Path) -> np.ndarray:
+    if cv2 is None:
+        raise RuntimeError("OpenCV not available and ffprobe failed. Install cv2 or ensure ffprobe exists.")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    pts_sec = []
+    while True:
+        ok, _ = cap.read()
+        if not ok:
+            break
+        ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+        pts_sec.append(float(ms) / 1000.0)
+    cap.release()
+    pts = np.asarray(pts_sec, dtype=float)
+    if len(pts) < 10:
+        raise RuntimeError("OpenCV timeline too short or failed.")
+    pts = pts - pts[0]
+    pts = np.maximum.accumulate(pts)
+    return pts
+
+def build_video_timeline_master(video_path: Path, trim_start_sec: float) -> Dict[str, np.ndarray]:
+    pts = get_video_pts_ffprobe(video_path)
+    method = "ffprobe_pts"
+    if pts is None:
+        pts = get_video_pts_opencv(video_path)
+        method = "opencv_pos_msec"
+
+    ensure_monotonic_increasing(pts, "video pts")
+
+    trim = float(trim_start_sec)
+    if trim < 0:
+        raise ValueError("TRIM_START_SEC must be >= 0")
+
+    start_idx = int(np.searchsorted(pts, trim, side="left"))
+    if start_idx >= len(pts) - 1:
+        raise ValueError("Trim is beyond video length.")
+
+    pts_master = pts[start_idx:] - pts[start_idx]
+
+    (out_dir / "video_timeline_meta.json").write_text(json.dumps({
+        "video": str(video_path),
+        "method": method,
+        "n_frames": int(len(pts)),
+        "trim_start_sec": trim,
+        "master_start_frame_index": start_idx,
+        "duration_orig_sec": float(pts[-1]),
+        "duration_master_sec": float(pts_master[-1]),
+    }, indent=2))
+
+    return {
+        "pts_orig_sec": pts,
+        "pts_master_sec": pts_master,
+        "master_start_idx": np.array([start_idx], dtype=int),
+        "method": np.array([0], dtype=int),
+    }
+
+def master_time_to_master_frame_idx(pts_master_sec: np.ndarray, t_master: float) -> int:
+    i = int(np.searchsorted(pts_master_sec, t_master, side="left"))
+    if i <= 0:
+        return 0
+    if i >= len(pts_master_sec):
+        return len(pts_master_sec) - 1
+    if abs(float(pts_master_sec[i]) - t_master) < abs(float(pts_master_sec[i-1]) - t_master):
+        return i
+    return i - 1
+
+
+# ============================================================
+# Fiber pipeline (MASTER-aligned)
+# ============================================================
+def prepare_fiber_master(fiber_csv: Path, trim_start_sec: float) -> pd.DataFrame:
+    df = pd.read_csv(fiber_csv)
+    cols = {c.lower(): c for c in df.columns}
+
+    # time column
+    time_candidates = [k for k in cols if k in ("time", "timestamp", "t", "seconds", "sec", "ms", "us")]
+    if not time_candidates:
+        for k in cols:
+            if "time" in k or "stamp" in k:
+                time_candidates.append(k)
+                break
+    if not time_candidates:
+        raise ValueError("Fiber CSV: could not find a time column (need 'time'/'timestamp'-like).")
+    tcol = cols[time_candidates[0]]
+
+    # signal/control columns
+    sig_candidates = [k for k in cols if k in ("signal", "gcamp", "green", "sig")]
+    ctrl_candidates = [k for k in cols if k in ("control", "isosbestic", "uv", "violet", "ctrl")]
+
+    if sig_candidates:
+        sig_col = cols[sig_candidates[0]]
+    else:
+        numeric_cols = [c for c in df.columns if c != tcol and pd.api.types.is_numeric_dtype(df[c])]
+        if not numeric_cols:
+            raise ValueError("Fiber CSV: need at least one numeric signal column.")
+        sig_col = numeric_cols[0]
+
+    ctrl_col = cols[ctrl_candidates[0]] if ctrl_candidates else None
+
+    t_sec = detect_time_unit_and_to_seconds(df[tcol].to_numpy())
+    trim = float(trim_start_sec)
+    t_master = t_sec - trim
+    mask = t_master >= 0
+    t_master = t_master[mask]
+    sig = df.loc[mask, sig_col].to_numpy(dtype=float)
+    ctrl = df.loc[mask, ctrl_col].to_numpy(dtype=float) if ctrl_col is not None else None
+
+    if len(t_master) < 10:
+        raise ValueError("Fiber CSV too short after trim.")
+
+    dt = float(np.nanmedian(np.diff(t_master)))
+    tau = 60.0
+    alpha = min(1.0, max(0.001, dt / tau))
+
+    sig_tr = ema_trend(sig, alpha=alpha)
+    sig_detr = sig - sig_tr
+
+    if ctrl is not None:
+        ctrl_tr = ema_trend(ctrl, alpha=alpha)
+        ctrl_detr = ctrl - ctrl_tr
+
+        sig_norm = (sig_detr - np.nanmedian(sig_detr)) / (np.nanstd(sig_detr) + 1e-12)
+        ctrl_norm = (ctrl_detr - np.nanmedian(ctrl_detr)) / (np.nanstd(ctrl_detr) + 1e-12)
+
+        ra, rb = linear_fit_affine(ctrl_norm, sig_norm)
+        sig_corr = sig_norm - (ra * ctrl_norm + rb)
+
+        base = float(np.nanmedian(sig_corr))
+        df_over_f = (sig_corr - base) / (abs(base) + 1e-12)
+    else:
+        sig_corr = (sig_detr - np.nanmedian(sig_detr)) / (np.nanstd(sig_detr) + 1e-12)
+        base = float(np.nanmedian(sig_corr))
+        df_over_f = (sig_corr - base) / (abs(base) + 1e-12)
+
+    out = pd.DataFrame({
+        "t_master_sec": t_master,
+        "sig_corr": sig_corr,
+        "df_over_f": df_over_f,
+    })
+
+    try:
+        out.to_parquet(out_dir / "fiber_master.parquet", index=False)
+    except Exception:
+        out.to_csv(out_dir / "fiber_master.csv", index=False)
+
+    return out
+
+
+# ============================================================
+# MedPC load
+# ============================================================
+def load_medpc_events(beh_csv: Path) -> Tuple[pd.DataFrame, np.ndarray, str]:
+    df = pd.read_csv(beh_csv)
+
+    # self_administrator
+    sa_col = None
+    for c in df.columns:
+        if c.strip().lower() == "self_administrator":
+            sa_col = c
+            break
+    if sa_col is None:
+        for c in df.columns:
+            if "self" in c.lower() and "admin" in c.lower():
+                sa_col = c
+                break
+
+    self_admin_value = ""
+    if sa_col is not None and len(df) > 0:
+        s = df[sa_col].dropna()
+        if len(s) > 0:
+            self_admin_value = str(s.iloc[0])
+
+    # time/event column
+    candidates = []
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ("time", "timestamp", "event_time", "eventtime", "t", "sec", "seconds", "ms", "millis"):
+            if pd.api.types.is_numeric_dtype(df[c]):
+                candidates.append(c)
+    if not candidates:
+        for c in df.columns:
+            if ("time" in c.lower() or "stamp" in c.lower()) and pd.api.types.is_numeric_dtype(df[c]):
+                candidates.append(c)
+                break
+    if not candidates:
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if not num_cols:
+            raise ValueError("MedPC CSV: could not find numeric time/event column.")
+        candidates = [num_cols[0]]
+
+    tcol = candidates[0]
+    t_raw = df[tcol].to_numpy(dtype=float)
+    t_sec = detect_time_unit_and_to_seconds(t_raw)
+
+    order = np.argsort(t_sec)
+    t_sec_sorted = t_sec[order]
+    df_sorted = df.iloc[order].reset_index(drop=False).rename(columns={"index": "orig_row_index"})
+    ensure_monotonic_increasing(t_sec_sorted, "MedPC event times")
+    return df_sorted, t_sec_sorted, self_admin_value
+
+
+# ============================================================
+# Monotonic DP matching
+# ============================================================
+def dp_match_monotonic(
+    t_medpc: np.ndarray,
+    t_anchor_master: np.ndarray,
+    initial_a: float,
+    initial_b: float,
+    max_abs_err: float,
+    max_interval_rel_err: float
+) -> List[Tuple[int, int]]:
+    """
+    Monotonic DP: choose increasing medpc indices to match anchors in order.
+    Candidate set per anchor is chosen around an initial guess.
+    """
+    nA = len(t_anchor_master)
+    nM = len(t_medpc)
+    if nA == 0 or nM == 0:
+        return []
+
+    cand: List[np.ndarray] = []
+    for i in range(nA):
+        target_med = (t_anchor_master[i] - initial_b) / (initial_a + 1e-12)
+        lo_t = target_med - max_abs_err
+        hi_t = target_med + max_abs_err
+        lo = int(np.searchsorted(t_medpc, lo_t, side="left"))
+        hi = int(np.searchsorted(t_medpc, hi_t, side="right"))
+        idxs = np.arange(max(0, lo), min(nM, hi), dtype=int)
+        if len(idxs) == 0:
+            j = int(np.clip(np.searchsorted(t_medpc, target_med), 0, nM - 1))
+            idxs = np.arange(max(0, j - 50), min(nM, j + 51), dtype=int)
+        cand.append(idxs)
+
+    INF = 1e18
+    dp = [np.full(len(cand[i]), INF, dtype=float) for i in range(nA)]
+    prev = [np.full(len(cand[i]), -1, dtype=int) for i in range(nA)]
+
+    err0: List[np.ndarray] = []
+    for i in range(nA):
+        idxs = cand[i]
+        pred = initial_a * t_medpc[idxs] + initial_b
+        e = np.abs(pred - t_anchor_master[i])
+        err0.append(e)
+
+    dp[0] = err0[0].copy()
+
+    for i in range(1, nA):
+        Ai = float(t_anchor_master[i])
+        Aprev = float(t_anchor_master[i - 1])
+        dA = Ai - Aprev
+
+        prev_candidates = cand[i - 1]
+        for kk, m_idx in enumerate(cand[i]):
+            cutoff = int(np.searchsorted(prev_candidates, m_idx, side="left"))
+            if cutoff <= 0:
+                continue
+            start = max(0, cutoff - 200)
+
+            best = INF
+            bestp = -1
+            for pp in range(start, cutoff):
+                m_prev = int(prev_candidates[pp])
+                dM = float(t_medpc[m_idx] - t_medpc[m_prev])
+                if dM <= 0:
+                    continue
+
+                pred_dA = float(initial_a * dM)
+                rel = abs(pred_dA - dA) / (abs(dA) + 1e-9)
+                interval_pen = 0.0
+                if rel > max_interval_rel_err:
+                    interval_pen = (rel - max_interval_rel_err) * 10.0
+
+                score = float(dp[i - 1][pp] + err0[i][kk] + interval_pen)
+                if score < best:
+                    best = score
+                    bestp = pp
+
+            dp[i][kk] = best
+            prev[i][kk] = bestp
+
+    end_k = int(np.argmin(dp[-1]))
+    if not np.isfinite(dp[-1][end_k]):
+        # fallback greedy
+        out = []
+        last = -1
+        for i in range(nA):
+            idxs = cand[i]
+            pred = initial_a * t_medpc[idxs] + initial_b
+            e = np.abs(pred - t_anchor_master[i])
+            order = np.argsort(e)
+            chosen = None
+            for j in order:
+                if int(idxs[j]) > last and float(e[j]) <= max_abs_err:
+                    chosen = int(idxs[j])
+                    break
+            if chosen is None:
+                continue
+            out.append((i, chosen))
+            last = chosen
+        return out
+
+    pairs = []
+    k = end_k
+    for i in range(nA - 1, -1, -1):
+        pairs.append((i, int(cand[i][k])))
+        k = int(prev[i][k]) if i > 0 else -1
+        if i > 0 and k < 0:
+            break
+    pairs.reverse()
+
+    good = []
+    for (i, j) in pairs:
+        pred = initial_a * float(t_medpc[j]) + initial_b
+        if abs(pred - float(t_anchor_master[i])) <= max_abs_err:
+            good.append((i, j))
+    return good
+
+def fit_medpc_to_master_affine(
+    t_medpc: np.ndarray,
+    t_anchor_master: np.ndarray,
+    pairs: List[Tuple[int, int]]
+) -> Tuple[float, float]:
+    if len(pairs) < 2:
+        raise ValueError("Not enough matches to fit affine mapping.")
+    x = np.array([t_medpc[j] for _, j in pairs], dtype=float)
+    y = np.array([t_anchor_master[i] for i, _ in pairs], dtype=float)
+    return linear_fit_affine(x, y)
+
+
+# ============================================================
+# NEAREST candidates printing (like your example)
+# ============================================================
+def print_nearest_candidates(
+    label: str,
+    anchors: np.ndarray,
+    t_medpc: np.ndarray,
+    a: float,
+    b: float,
+    topk: int = 3
+) -> None:
+    """
+    For each manual anchor time (MASTER), list top-k nearest MedPC events (after mapping to MASTER).
+    """
+    t_medpc_master = a * t_medpc + b
+    print(f"\n[NEAREST] {label}")
+    for at in anchors:
+        err = np.abs(t_medpc_master - float(at))
+        idxs = np.argsort(err)[:topk]
+        parts = []
+        for j in idxs:
+            parts.append(f"{t_medpc_master[j]:9.3f}s err={err[j]:6.3f}")
+        print(f"  manual {float(at):7.3f}s -> " + " | ".join(parts))
+
+def print_nearest_windows(
+    anchors_all: np.ndarray,
+    t_medpc: np.ndarray,
+    a: float,
+    b: float
+) -> None:
+    """
+    A simple windowing similar to your example:
+      - first 10 anchors
+      - middle block (next 5)
+      - last block (rest)
+    """
+    n = len(anchors_all)
+    a0 = anchors_all[:min(10, n)]
+    amid = anchors_all[min(10, n):min(15, n)]
+    aend = anchors_all[min(15, n):]
+
+    if len(a0):
+        print_nearest_candidates("w0_10", a0, t_medpc, a, b, topk=3)
+    if len(amid):
+        print_nearest_candidates("wmid", amid, t_medpc, a, b, topk=3)
+    if len(aend):
+        print_nearest_candidates("w35_45", aend, t_medpc, a, b, topk=3)
+
+
+# ============================================================
+# Leave-one-anchor-out selection
+# ============================================================
+@dataclass
+class AnchorScenario:
+    drop_index: Optional[int]   # None means drop nothing
+    kept_anchors: np.ndarray
+    pairs: List[Tuple[int, int]]
+    a: float
+    b: float
+    score: float
+    median_abs_err: float
+    rmse: float
+    n_matches: int
+
+def score_solution(
+    t_medpc: np.ndarray,
+    anchors: np.ndarray,
+    pairs: List[Tuple[int, int]],
+    a: float,
+    b: float,
+    penalty_fewer: float
+) -> Tuple[float, float, float]:
+    """
+    Score uses robust median abs error + RMSE + penalty for fewer matches.
+    Lower is better.
+    """
+    if len(pairs) == 0:
+        return 1e18, 1e18, 1e18
+
+    abs_errs = []
+    for (ai, mj) in pairs:
+        pred = a * float(t_medpc[mj]) + b
+        abs_errs.append(abs(pred - float(anchors[ai])))
+    abs_errs = np.array(abs_errs, dtype=float)
+
+    med = float(np.median(abs_errs))
+    rmse = float(np.sqrt(np.mean(abs_errs**2)))
+
+    frac = len(pairs) / max(1, len(anchors))
+    penalty = penalty_fewer * (1.0 - frac)
+
+    score = med + 0.25 * rmse + penalty
+    return score, med, rmse
+
+def choose_best_anchor_scenario(
+    t_medpc: np.ndarray,
+    anchors_all: np.ndarray,
+    initial_a: float,
+    initial_b: float,
+    max_abs_err: float,
+    max_interval_rel_err: float,
+    allow_drop_none: bool,
+    penalty_fewer: float
+) -> AnchorScenario:
+    scenarios: List[AnchorScenario] = []
+
+    drop_options: List[Optional[int]] = [None] if allow_drop_none else []
+    drop_options += list(range(len(anchors_all)))
+
+    for d in drop_options:
+        if d is None:
+            anchors = anchors_all.copy()
+        else:
+            anchors = np.delete(anchors_all, d)
+
+        pairs = dp_match_monotonic(
+            t_medpc=t_medpc,
+            t_anchor_master=anchors,
+            initial_a=initial_a,
+            initial_b=initial_b,
+            max_abs_err=max_abs_err,
+            max_interval_rel_err=max_interval_rel_err
+        )
+
+        if len(pairs) < 2:
+            # unusable
+            scenarios.append(AnchorScenario(
+                drop_index=d, kept_anchors=anchors, pairs=pairs,
+                a=np.nan, b=np.nan, score=1e18,
+                median_abs_err=1e18, rmse=1e18, n_matches=len(pairs)
+            ))
+            continue
+
+        a_fit, b_fit = fit_medpc_to_master_affine(t_medpc, anchors, pairs)
+        sc, med, rmse = score_solution(t_medpc, anchors, pairs, a_fit, b_fit, penalty_fewer)
+
+        scenarios.append(AnchorScenario(
+            drop_index=d, kept_anchors=anchors, pairs=pairs,
+            a=a_fit, b=b_fit, score=sc,
+            median_abs_err=med, rmse=rmse, n_matches=len(pairs)
+        ))
+
+    # pick best
+    scenarios.sort(key=lambda s: s.score)
+    return scenarios[0]
+
+
+# ============================================================
+# Peri-event analysis
+# ============================================================
+def extract_peri_event(
+    fiber_df: pd.DataFrame,
+    event_t: float,
+    pre: float,
+    post: float
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    t = fiber_df["t_master_sec"].to_numpy(dtype=float)
+    y = fiber_df["df_over_f"].to_numpy(dtype=float)
+
+    t0 = event_t - pre
+    t1 = event_t + post
+    if t0 < float(t[0]) or t1 > float(t[-1]):
+        return None
+
+    dt = float(np.nanmedian(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        return None
+
+    grid = np.arange(-pre, post + 1e-9, dt, dtype=float)
+    target = event_t + grid
+    y_i = np.interp(target, t, y)
+    return grid, y_i
+
+def robust_zscore_trace(grid: np.ndarray, trace: np.ndarray, baseline_win_sec: float) -> np.ndarray:
+    mask = (grid >= -baseline_win_sec) & (grid < 0)
+    if not np.any(mask):
+        med, mad = robust_median_mad(trace)
+    else:
+        med, mad = robust_median_mad(trace[mask])
+    scale = 1.4826 * mad
+    if scale <= 1e-12:
+        scale = 1e-12
+    return (trace - med) / scale
+
+def auc_trapz(x: np.ndarray, y: np.ndarray, t0: float = 0.0, t1: Optional[float] = None) -> Tuple[float, float]:
+    if t1 is None:
+        t1 = float(x[-1])
+    m = (x >= t0) & (x <= t1)
+    if not np.any(m):
+        return 0.0, 0.0
+    xx = x[m]
+    yy = y[m]
+    net = float(np.trapz(yy, xx))
+    pos = float(np.trapz(np.maximum(yy, 0.0), xx))
+    return net, pos
+
+
+# ============================================================
+# Video clip extraction (time-based)
+# ============================================================
+def write_video_clip_vfr_safe(
+    video_path: Path,
+    t_center_master: float,
+    pre: float,
+    post: float,
+    out_path: Path,
+    overlay_text: Optional[str] = None
+) -> None:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found in PATH.")
+
+    trim_start = float(TRIM_START_SEC)
+    t0_m = max(0.0, t_center_master - pre)
+    t1_m = t_center_master + post
+
+    ss = trim_start + t0_m
+    to = trim_start + t1_m
+
+    if overlay_text:
+        txt = overlay_text.replace(":", "\\:").replace("'", "\\'")
+        vf = f"drawtext=text='{txt}':x=20:y=20:fontsize=24:box=1"
+        cmd = ["ffmpeg", "-y", "-ss", f"{ss:.3f}", "-to", f"{to:.3f}", "-i", str(video_path),
+               "-vf", vf, "-c:a", "copy", str(out_path)]
+    else:
+        cmd = ["ffmpeg", "-y", "-ss", f"{ss:.3f}", "-to", f"{to:.3f}", "-i", str(video_path),
+               "-c", "copy", str(out_path)]
+
+    rc, _, err = safe_run(cmd)
+    if rc != 0:
+        # fallback: re-encode
+        cmd2 = ["ffmpeg", "-y", "-ss", f"{ss:.3f}", "-to", f"{to:.3f}", "-i", str(video_path),
+                "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-c:a", "aac", "-b:a", "128k",
+                str(out_path)]
+        rc2, _, err2 = safe_run(cmd2)
+        if rc2 != 0:
+            raise RuntimeError(f"ffmpeg clip failed:\n{err}\n---\n{err2}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main() -> None:
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    total_steps = 8
+    step = 0
+
+    step += 1; pbar(step, total_steps, "Video timeline (VFR-safe PTS)")
+    video_tl = build_video_timeline_master(video_file, TRIM_START_SEC)
+    pts_master = video_tl["pts_master_sec"]
+    master_start_idx = int(video_tl["master_start_idx"][0])
+
+    step += 1; pbar(step, total_steps, "Fiber preprocessing -> MASTER")
+    fiber_df = prepare_fiber_master(fiber_file, TRIM_START_SEC)
+
+    step += 1; pbar(step, total_steps, "Load MedPC events (+ self_administrator)")
+    medpc_df, t_medpc_sec, self_admin_value = load_medpc_events(beh_file)
+
+    # Initial wall-clock prior
+    off = clock_offset_seconds(MEDPC_START_CLOCK, FIBER_VIDEO_START_CLOCK)
+    initial_a = 1.0
+    initial_b = -off  # if MedPC started 56s earlier => b=+56 so MedPC 56s maps near MASTER 0
+
+    print("\n=== INITIAL PRIOR (from wall clocks) ===")
+    print(f"clock_offset_sec (MedPC - Fiber/Video) = {off:.3f} sec")
+    print(f"initial mapping: MASTER ≈ {initial_a:.6f} * MedPC + {initial_b:.6f}")
+
+    # Show nearest table under prior (quick sanity)
+    print_nearest_windows(MANUAL_VIDEO_ANCHORS_MASTER_SEC, t_medpc_sec, initial_a, initial_b)
+
+    # Choose best LOO scenario (drop none or drop exactly one anchor)
+    step += 1; pbar(step, total_steps, "Anchor matching: monotonic DP + affine (with leave-one-out)")
+    if LOO_ENABLE:
+        best = choose_best_anchor_scenario(
+            t_medpc=t_medpc_sec,
+            anchors_all=MANUAL_VIDEO_ANCHORS_MASTER_SEC,
+            initial_a=initial_a,
+            initial_b=initial_b,
+            max_abs_err=MAX_ABS_TIME_ERR_SEC,
+            max_interval_rel_err=MAX_INTERVAL_REL_ERR,
+            allow_drop_none=LOO_ALLOW_DROP_NONE,
+            penalty_fewer=LOO_PENALTY_FOR_FEWER_MATCHES
+        )
+        dropped = best.drop_index
+        kept_anchors = best.kept_anchors
+        pairs = best.pairs
+        a_fit, b_fit = best.a, best.b
+    else:
+        dropped = None
+        kept_anchors = MANUAL_VIDEO_ANCHORS_MASTER_SEC.copy()
+        pairs = dp_match_monotonic(
+            t_medpc=t_medpc_sec,
+            t_anchor_master=kept_anchors,
+            initial_a=initial_a,
+            initial_b=initial_b,
+            max_abs_err=MAX_ABS_TIME_ERR_SEC,
+            max_interval_rel_err=MAX_INTERVAL_REL_ERR
+        )
+        if len(pairs) < 2:
+            raise RuntimeError(f"Matching failed: only {len(pairs)} matches found.")
+        a_fit, b_fit = fit_medpc_to_master_affine(t_medpc_sec, kept_anchors, pairs)
+
+    # Print decision
+    print("\n=== MATCHING DECISION ===")
+    if dropped is None:
+        print("Dropped anchor: NONE (kept all manual anchors)")
+    else:
+        print(f"Dropped anchor index: {dropped}  (manual time={MANUAL_VIDEO_ANCHORS_MASTER_SEC[dropped]:.3f}s)")
+    print(f"Affine fit: MASTER ≈ {a_fit:.9f} * MedPC + {b_fit:.9f}")
+    print(f"Matches used: {len(pairs)} / {len(kept_anchors)}")
+
+    # Show nearest table under fitted mapping (your requested style)
+    print_nearest_windows(kept_anchors, t_medpc_sec, a_fit, b_fit)
+
+    # Build match report (which MedPC event matched which manual anchor)
+    match_rows = []
+    for (ai, mj) in pairs:
+        anchor_t = float(kept_anchors[ai])
+        med_t = float(t_medpc_sec[mj])
+        pred = a_fit * med_t + b_fit
+        match_rows.append({
+            "anchor_index_within_kept": int(ai),
+            "anchor_master_sec": anchor_t,
+            "medpc_index_sorted": int(mj),
+            "medpc_time_sec": med_t,
+            "pred_master_sec": float(pred),
+            "abs_err_sec": float(abs(pred - anchor_t)),
+            "self_administrator": self_admin_value,
+            "medpc_orig_row_index": int(medpc_df.loc[mj, "orig_row_index"]),
+        })
+    match_report = pd.DataFrame(match_rows)
+    match_report.to_csv(out_dir / "alignment_report.csv", index=False)
+
+    # Apply affine to ALL MedPC events -> MASTER
+    t_medpc_master = a_fit * t_medpc_sec + b_fit
+    medpc_df_out = medpc_df.copy()
+    medpc_df_out["medpc_time_sec"] = t_medpc_sec
+    medpc_df_out["master_time_sec"] = t_medpc_master
+    medpc_df_out.to_csv(out_dir / "medpc_events_master.csv", index=False)
+
+    # Peri-event analysis for all events
+    step += 1; pbar(step, total_steps, "Peri-event extraction (robust Z), refractory filtering")
+    grids = None
+    traces = []
+    valid = []
+
+    order = np.argsort(t_medpc_master)
+    t_sorted = t_medpc_master[order]
+    idx_sorted = order
+
+    last_kept = -1e18
+    for k, ev_t in zip(idx_sorted, t_sorted):
+        if float(ev_t) - last_kept < REFRACTORY_SEC:
+            continue
+        pe = extract_peri_event(fiber_df, float(ev_t), PRE_SEC, POST_SEC)
+        if pe is None:
+            continue
+        grid, tr = pe
+        z = robust_zscore_trace(grid, tr, BASELINE_WIN_SEC)
+        if grids is None:
+            grids = grid
+        traces.append(z)
+        valid.append((int(k), float(ev_t)))
+        last_kept = float(ev_t)
+
+    if grids is None or len(traces) == 0:
+        raise RuntimeError("No valid peri-event windows found.")
+
+    Z = np.vstack(traces)
+    post_mask = grids >= 0
+    peak_z = np.max(Z[:, post_mask], axis=1)
+    sort_by_peak = np.argsort(-peak_z)
+
+    # Select top clips
+    step += 1; pbar(step, total_steps, "Select top events + write clips (time-based, VFR-safe)")
+    top_n = min(TARGET_CLIPS, len(valid))
+    selected = sort_by_peak[:top_n]
+
+    clip_rows = []
+    for rank, si in enumerate(selected, start=1):
+        medpc_idx, ev_t = valid[int(si)]
+        pz = float(peak_z[int(si)])
+
+        clip_name = f"clip_rank{rank:03d}_medpcIdx{medpc_idx}_t{ev_t:.3f}_pz{pz:.2f}.mp4"
+        out_path = clips_dir / clip_name
+        overlay = f"rank={rank}  medpcIdx={medpc_idx}  tMASTER={ev_t:.2f}s  peakZ={pz:.2f}"
+
+        try:
+            write_video_clip_vfr_safe(
+                video_path=video_file,
+                t_center_master=ev_t,
+                pre=CLIP_PRE_SEC,
+                post=CLIP_POST_SEC,
+                out_path=out_path,
+                overlay_text=overlay
+            )
+            ok = True
+            note = "OK"
+        except Exception as e:
+            ok = False
+            note = f"FAILED: {e}"
+
+        clip_rows.append({
+            "rank": rank,
+            "medpc_index_sorted": medpc_idx,
+            "master_time_sec": ev_t,
+            "peak_z": pz,
+            "clip_path": str(out_path) if ok else "",
+            "note": note,
+        })
+
+    pd.DataFrame(clip_rows).to_csv(out_dir / "selected_clips_manifest.csv", index=False)
+
+    # Average trace, SEM, AUC
+    step += 1; pbar(step, total_steps, "Compute mean/SEM/AUC + save summary")
+    mean_trace = np.nanmean(Z, axis=0)
+    sem_trace = np.nanstd(Z, axis=0, ddof=1) / math.sqrt(Z.shape[0])
+    net_auc, pos_auc = auc_trapz(grids, mean_trace, t0=0.0, t1=POST_SEC)
+
+    np.savez(
+        out_dir / "peri_event_summary.npz",
+        t_rel=grids,
+        Z=Z,
+        peak_z=peak_z,
+        mean_trace=mean_trace,
+        sem_trace=sem_trace,
+        net_auc=net_auc,
+        pos_auc=pos_auc,
+        a_fit=a_fit,
+        b_fit=b_fit,
+        clock_offset_sec=off,
+        dropped_anchor_index=(-1 if dropped is None else int(dropped)),
+        dropped_anchor_time=(None if dropped is None else float(MANUAL_VIDEO_ANCHORS_MASTER_SEC[dropped])),
+        n_matches=len(pairs),
+        matches=np.array(pairs, dtype=int),
+    )
+
+    # Bootstrap (a,b) stability
+    step += 1; pbar(step, total_steps, "Bootstrap (a,b) stability")
+    boots = []
+    if len(pairs) >= 4:
+        rng = np.random.default_rng(RANDOM_SEED)
+        matched_anchor_idx = np.array([ai for ai, _ in pairs], dtype=int)
+        matched_med_idx = np.array([mj for _, mj in pairs], dtype=int)
+
+        for _ in range(BOOTSTRAP_N):
+            m = len(pairs)
+            take = max(2, int(round(BOOTSTRAP_FRAC * m)))
+            pick = rng.choice(np.arange(m), size=take, replace=True)
+            x = t_medpc_sec[matched_med_idx[pick]]
+            y = kept_anchors[matched_anchor_idx[pick]]
+            aa, bb = linear_fit_affine(x, y)
+            boots.append((aa, bb))
+
+        boots = np.array(boots, dtype=float)
+        pd.DataFrame({"a": boots[:, 0], "b": boots[:, 1]}).to_csv(out_dir / "bootstrap_affine_ab.csv", index=False)
+
+    # Meta
+    meta = {
+        "paths": {
+            "beh_file": str(beh_file),
+            "fiber_file": str(fiber_file),
+            "video_file": str(video_file),
+            "out_dir": str(out_dir),
+        },
+        "clocks": {
+            "MEDPC_START_CLOCK": MEDPC_START_CLOCK,
+            "FIBER_VIDEO_START_CLOCK": FIBER_VIDEO_START_CLOCK,
+            "clock_offset_sec_medpc_minus_fv": off,
+            "initial_mapping_master_eq": {"a": initial_a, "b": initial_b},
+            "fit_mapping_master_eq": {"a": a_fit, "b": b_fit},
+        },
+        "anchors": {
+            "n_manual_anchors_total": int(len(MANUAL_VIDEO_ANCHORS_MASTER_SEC)),
+            "dropped_anchor_index": (None if dropped is None else int(dropped)),
+            "dropped_anchor_time": (None if dropped is None else float(MANUAL_VIDEO_ANCHORS_MASTER_SEC[dropped])),
+            "n_kept_anchors": int(len(kept_anchors)),
+        },
+        "matching": {
+            "n_matches": int(len(pairs)),
+            "MAX_ABS_TIME_ERR_SEC": MAX_ABS_TIME_ERR_SEC,
+            "MAX_INTERVAL_REL_ERR": MAX_INTERVAL_REL_ERR,
+            "LOO_ENABLE": LOO_ENABLE,
+            "LOO_ALLOW_DROP_NONE": LOO_ALLOW_DROP_NONE,
+            "LOO_PENALTY_FOR_FEWER_MATCHES": LOO_PENALTY_FOR_FEWER_MATCHES,
+        },
+        "peri_event": {
+            "PRE_SEC": PRE_SEC,
+            "POST_SEC": POST_SEC,
+            "BASELINE_WIN_SEC": BASELINE_WIN_SEC,
+            "REFRACTORY_SEC": REFRACTORY_SEC,
+            "n_valid_events": int(len(valid)),
+            "net_auc": float(net_auc),
+            "pos_auc": float(pos_auc),
+        },
+        "self_administrator": self_admin_value,
+    }
+    (out_dir / "run_meta.json").write_text(json.dumps(meta, indent=2))
+
+    # Final small screen summary (you asked to print some results)
+    step += 1; pbar(step, total_steps, "Done")
+    print("\n=== QUICK SUMMARY ===")
+    print(f"self_administrator: {self_admin_value}")
+    print(f"Affine: MASTER ≈ {a_fit:.9f} * MedPC + {b_fit:.9f}")
+    if dropped is None:
+        print("Dropped anchor: NONE")
+    else:
+        print(f"Dropped anchor: idx={dropped}, t={MANUAL_VIDEO_ANCHORS_MASTER_SEC[dropped]:.3f}s")
+    print(f"Matches: {len(pairs)}")
+    print(f"Valid peri-events: {len(valid)}")
+    print(f"Mean-trace net AUC (0..{POST_SEC}s): {net_auc:.4f}")
+    print(f"Mean-trace pos AUC (0..{POST_SEC}s): {pos_auc:.4f}")
+
+    print("\nFILES:")
+    print(f"- {out_dir / 'alignment_report.csv'}")
+    print(f"- {out_dir / 'medpc_events_master.csv'}")
+    print(f"- {out_dir / 'selected_clips_manifest.csv'}")
+    print(f"- {out_dir / 'run_meta.json'}")
+    if (out_dir / 'bootstrap_affine_ab.csv').exists():
+        print(f"- {out_dir / 'bootstrap_affine_ab.csv'}")
+
+
+if __name__ == "__main__":
+    main()
