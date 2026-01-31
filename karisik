@@ -1,0 +1,202 @@
+SDKPATH ='/Users/abdullah/Desktop/TDTMatlabSDK'
+addpath(genpath(SDKPATH));
+savepath;
+which TDTbin2mat
+BLOCKPATH='/Users/abdullah/Desktop/new_lab/Dr_Brendan/CY-C-6-260122-154438'
+data = TDTbin2mat(BLOCKPATH);
+fieldnames(data.epocs)
+
+
+%% EXPORT CAM1 FRAME TIMING TO EXCEL
+% This script extracts camera frame timestamps from TDT data
+% and exports frame-by-frame timing information to an Excel file.
+%
+% Output columns:
+%   FrameIndex
+%   Time_sec
+%   DeltaTime_sec
+%   DeltaTime_ms
+%
+% Author: (your name)
+% Date: (today)
+
+%% ------------------ SET PATHS ------------------
+
+SDKPATH = '/Users/abdullah/Desktop/TDTMatlabSDK';
+addpath(genpath(SDKPATH));
+savepath;
+
+BLOCKPATH = '/Users/abdullah/Desktop/new_lab/Dr_Brendan/CY-C-6-260122-154438';
+
+%% ------------------ LOAD DATA ------------------
+
+fprintf('Loading TDT block:\n%s\n', BLOCKPATH);
+data = TDTbin2mat(BLOCKPATH, 'TYPE', {'epocs'});
+
+%% ------------------ CHECK CAM1 ------------------
+
+if ~isfield(data.epocs, 'Cam1')
+    error('Cam1 epoc not found. Camera timestamps were not recorded.');
+end
+
+%% ------------------ EXTRACT TIMESTAMPS ------------------
+
+cam_time = data.epocs.Cam1.onset(:);   % ensure column vector
+num_frames = length(cam_time);
+
+fprintf('Total frames detected: %d\n', num_frames);
+fprintf('Recording duration: %.3f seconds\n', cam_time(end));
+
+%% ------------------ COMPUTE INTER-FRAME INTERVALS ------------------
+
+% Inter-frame interval (difference between consecutive frames)
+delta_time = [NaN; diff(cam_time)];   % first frame has no previous interval
+
+delta_time_ms = delta_time * 1000;
+
+%% ------------------ CREATE TABLE ------------------
+
+FrameIndex   = (1:num_frames)';
+Time_sec     = cam_time;
+DeltaTime_sec = delta_time;
+DeltaTime_ms  = delta_time_ms;
+
+T = table( ...
+    FrameIndex, ...
+    Time_sec, ...
+    DeltaTime_sec, ...
+    DeltaTime_ms ...
+    );
+
+%% ------------------ EXPORT TO EXCEL ------------------
+
+output_file = fullfile(BLOCKPATH, 'Cam1_Frame_Timing.xlsx');
+
+writetable(T, output_file);
+
+fprintf('Excel file written to:\n%s\n', output_file);
+
+%% ------------------ OPTIONAL SUMMARY ------------------
+
+fprintf('\nTiming statistics (excluding first frame):\n');
+fprintf('Median interval: %.3f ms\n', median(delta_time_ms(2:end)));
+fprintf('Mean interval:   %.3f ms\n', mean(delta_time_ms(2:end)));
+fprintf('Std interval:    %.3f ms\n', std(delta_time_ms(2:end)));
+fprintf('Max interval:    %.3f ms\n', max(delta_time_ms(2:end)));
+
+fprintf('\nDONE.\n');
+
+
+
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def load_behdata(file_path: str) -> pd.DataFrame:
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Dosya bulunamadı: {p}")
+
+    ext = p.suffix.lower()
+
+    # 1) Excel
+    if ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(p)
+        return df
+
+    # 2) Metin tabanlı (CSV/TSV/TXT): delimiter otomatik tahmin
+    try:
+        df = pd.read_csv(p, sep=None, engine="python")
+        return df
+    except Exception:
+        # 3) Son çare: whitespace ile ayrılmış olabilir
+        df = pd.read_csv(p, delim_whitespace=True)
+        return df
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Kolon isimlerini normalize et (büyük/küçük harf farkı vs.)
+    colmap = {c: c.strip().lower() for c in df.columns}
+    inv = {v: k for k, v in colmap.items()}
+
+    needed = ["event", "onset", "offset"]
+    missing = [c for c in needed if c not in inv]
+    if missing:
+        raise ValueError(
+            f"Gerekli kolon(lar) eksik: {missing}\n"
+            f"Bulunan kolonlar: {list(df.columns)}\n"
+            f"Beklenen: Event, Onset, Offset (isimler büyük/küçük harfe duyarsız)"
+        )
+
+    df2 = df.rename(columns={
+        inv["event"]: "Event",
+        inv["onset"]: "Onset",
+        inv["offset"]: "Offset",
+    }).copy()
+
+    # Sayısal tipe çevir
+    df2["Onset"] = pd.to_numeric(df2["Onset"], errors="coerce")
+    df2["Offset"] = pd.to_numeric(df2["Offset"], errors="coerce")
+
+    # Bozuk satırları at
+    df2 = df2.dropna(subset=["Onset", "Offset"]).reset_index(drop=True)
+
+    return df2
+
+def plot_diff_curve(df: pd.DataFrame, output_png: str = "diff_curve.png",
+                    x_mode: str = "onset", smooth_window: int = 0):
+    """
+    x_mode:
+      - "onset": x ekseni Onset (zaman)
+      - "index": x ekseni satır sırası
+    smooth_window:
+      - 0: smoothing yok
+      - örn 3/5: hareketli ortalama ile yumuşatma
+    """
+    df = df.copy()
+    df["Diff"] = df["Offset"] - df["Onset"]
+
+    # Sırala: zaman akışı mantıklı olsun
+    df = df.sort_values("Onset").reset_index(drop=True)
+
+    if smooth_window and smooth_window > 1:
+        df["Diff_smooth"] = df["Diff"].rolling(window=smooth_window, center=True, min_periods=1).mean()
+        y = df["Diff_smooth"]
+        y_label = f"Offset - Onset (smooth={smooth_window})"
+    else:
+        y = df["Diff"]
+        y_label = "Offset - Onset"
+
+    if x_mode == "index":
+        x = range(len(df))
+        x_label = "Sıra"
+    else:
+        x = df["Onset"]
+        x_label = "Onset"
+
+    plt.figure()
+    plt.plot(x, y)
+    plt.xlabel(x_label)
+    plt.ylabel(y_label)
+    plt.title("Onset-Offset Arasındaki Fark (Eğri Grafiği)")
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=200)
+    plt.show()
+
+    return df
+
+if __name__ == "__main__":
+    # Buraya dosya yolunu yaz:
+    FILE = "/Users/abdullah/Desktop/new_lab/Dr_Brendan/CY-C-6-260122-154438/Data/BehData.csv"   # örn: "BehData.xlsx" / "BehData.csv"
+    OUT  = "diff_curve.png"
+
+    df_raw = load_behdata(FILE)
+    df = normalize_columns(df_raw)
+
+    # Grafik:
+    # x_mode="onset" -> x ekseni zaman (Onset)
+    # smooth_window=0 -> smoothing yok (istersen 3 veya 5 yap)
+    df_result = plot_diff_curve(df, output_png=OUT, x_mode="onset", smooth_window=0)
+
+    # İstersen farkları dosyaya da yazdır:
+    df_result.to_csv("behdata_with_diff.csv", index=False)
+    print("Bitti. Çıktılar: diff_curve.png ve behdata_with_diff.csv")
