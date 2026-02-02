@@ -1,0 +1,127 @@
+library(data.table)
+library(ggplot2)
+library(dplyr)
+library(rlang)
+
+# ==== 0) New directory ====
+setwd("/Users/abdullah/Desktop/test")
+getwd()
+list.files()
+
+# ==== 1) Fiber photometry data ====
+fiber <- fread("Ca2Data.csv", header = TRUE)
+head(fiber)
+
+fiber$sec <- as.integer(fiber$TimeStamp)
+SigBySec <- aggregate(Signal ~ sec, FUN = mean, data = fiber)
+CtlBySec <- aggregate(Control ~ sec, FUN = mean, data = fiber)
+
+# ==== 2) Nosepoke event file: ====
+if (file.exists("nosepokeEvents.csv")) {
+  nosepokeEvents <- read.csv("nosepokeEvents.csv", header = TRUE, check.names = FALSE)
+
+  # If the first column is index, drop it (may come as unnamed or like X)
+  if (names(nosepokeEvents)[1] == "" || grepl("^X$", names(nosepokeEvents)[1])) {
+    nosepokeEvents <- nosepokeEvents[, -1, drop = FALSE]
+  }
+
+  # If duration column doesn't exist, assume the last column is duration
+  if (!("duration" %in% names(nosepokeEvents))) {
+    names(nosepokeEvents)[ncol(nosepokeEvents)] <- "duration"
+  }
+
+  # If cluster_start / cluster_end don't exist (file may have different names) don't touch here.
+  # But at least don't proceed silently if these names are missing:
+  if (!("cluster_start" %in% names(nosepokeEvents)) || !("cluster_end" %in% names(nosepokeEvents))) {
+    stop("I couldn't find cluster_start and cluster_end columns in nosepokeEvents.csv. Check the column names in the file.")
+  }
+
+} else {
+  nose <- read.csv(file = "deneme.csv", head = TRUE)
+  head(nose)
+
+  identify_clusters_by_timing <- function(df, timing_col = "self_administrator", t = 1) {
+    df_sorted <- df[order(df[[timing_col]]), ]
+    time_values <- df_sorted[[timing_col]]
+    is_new_cluster <- c(TRUE, diff(time_values) > t)
+    df_sorted$cluster_id <- cumsum(is_new_cluster)
+
+    cluster_summary <- df_sorted %>%
+      group_by(cluster_id) %>%
+      summarise(
+        cluster_start = min(!!sym(timing_col)),
+        cluster_end   = max(!!sym(timing_col)),
+        cluster_size  = n(),
+        .groups = "drop"
+      )
+
+    avg_intercluster_interval <- NA
+    if (nrow(cluster_summary) > 1) {
+      intercluster_intervals <- cluster_summary$cluster_start[-1] - cluster_summary$cluster_end[-nrow(cluster_summary)]
+      avg_intercluster_interval <- mean(intercluster_intervals)
+    }
+
+    list(
+      data_with_clusters = df_sorted,
+      cluster_summary = cluster_summary,
+      avg_intercluster_interval = avg_intercluster_interval
+    )
+  }
+
+  cluster_results <- identify_clusters_by_timing(subset(nose, !is.na(self_administrator)), t = 1)
+  head(cluster_results$data_with_clusters)
+  head(cluster_results$cluster_summary)
+  round(cluster_results$avg_intercluster_interval, 2)
+
+  nosepokeEvents <- cluster_results$cluster_summary
+  nosepokeEvents$duration <- nosepokeEvents$cluster_end - nosepokeEvents$cluster_start
+
+  write.table(file = "nosepokeEvents.csv", nosepokeEvents, sep = ",", row.names = FALSE, col.names = TRUE)
+}
+
+# ==== group by duration into 0/1/2/3 sec ====
+# 0 = [0,1), 1 = [1,2), 2 = [2,3), 3 = [3, +inf)
+nosepokeEvents$duration_group <- pmin(floor(nosepokeEvents$duration), 3)
+
+table(nosepokeEvents$duration_group, useNA = "ifany")
+
+# ==== 4) Signal at event time (for overlay) ====
+# We pull the signal at event start time from SigBySec using approx
+nosepokeEvents$Signal_at_start <- approx(
+  x = SigBySec$sec,
+  y = SigBySec$Signal,
+  xout = nosepokeEvents$cluster_start,
+  rule = 2
+)$y
+
+# If you want, save grouped separately:
+write.table(file = "nosepokeEvents_grouped.csv", nosepokeEvents, sep = ",", row.names = FALSE, col.names = TRUE)
+
+# ==== 6) Plot (minimal addition to plot) ====
+p1 <- ggplot() +
+  # raw signal
+  geom_line(
+    data = SigBySec,
+    aes(x = sec, y = Signal),
+    color = "grey"
+  ) +
+  # nosepoke events: split by duration_group
+  geom_point(
+    data = nosepokeEvents,
+    aes(x = cluster_start, y = Signal_at_start, size = duration, color = factor(duration_group)),
+    alpha = 0.85
+  ) +
+  labs(
+    x = "Time (sec)",
+    y = "Signal",
+    color = "Duration group (sec)",
+    size = "Duration (sec)"
+  ) +
+  theme_classic()
+
+pdf(file = "nosepoke_vs_fiber_signal.pdf", width = 12, height = 8)
+p1
+dev.off()
+
+# ==== 7) Quick check ====
+subset(nosepokeEvents, duration > 3)
