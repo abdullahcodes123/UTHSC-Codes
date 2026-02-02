@@ -178,7 +178,7 @@ intervals <- intervals %>%
     y_label_uc   = y_top + label_offset + 0.04 * y_top
   )
 
-# ==== 6) Plot (minimal addition to professor's plot) ====
+# ==== 6) Plot (minimal addition to plot) ====
 p1 <- ggplot() +
   # intervals you provided: light grey55 band
   geom_rect(
