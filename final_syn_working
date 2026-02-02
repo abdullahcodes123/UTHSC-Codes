@@ -1,0 +1,1329 @@
+"""
+================================================================================
+MASTER CLOCK = (FIBER trimmed & re-zero) == (REAL VIDEO TIME from BehData trimmed & re-zero)
+
+Video file timeline may be "compressed" (e.g., forced 20 fps) -> DO NOT trust its clock.
+We build a REAL video-time axis from BehData (frame -> real seconds).
+
+What you asked for:
+- ALL tunable "magic values" are gathered in ONE CONFIG block at the top.
+- Values are "human-tunable" (avoid 1e-6 style where possible for knobs; tiny eps stays internal).
+- For ALL MedPC points:
+    * report which video second they correspond to (REAL video time + DISPLAYED video time)
+    * report how close/far to nearest manual anchor (distance in seconds + label)
+- Prints a console report AND writes CSVs.
+
+Pipeline
+--------
+0) Read BehData.csv: rows are frames; Onset is real time (s) for each frame.
+1) Read video frame PTS (ffprobe best_effort_timestamp_time) => displayed timeline per frame.
+2) Build mapping:
+   displayed_time -> frame_idx (via ffprobe PTS)
+   frame_idx -> real_time (via BehData Onset)
+   => displayed_time -> real_time
+   and inverse real_time -> frame_idx.
+3) Manual anchors are annotated on DISPLAYED (compressed) timeline mm:ss.mmm.
+   Convert each anchor to REAL time via displayed->frame->BehData.
+   Then apply TRIM_START_SEC (real-time trimming) and re-zero => MASTER axis.
+4) MedPC events -> seconds -> (optional cluster)
+5) Align manual(MASTER) to MedPC via coarse affine + featured DP.
+6) Fiber peri-event uses corrected MedPC times in MASTER.
+7) Clip writing uses MASTER == REAL-video (trimmed) -> frame idx (BehData) -> actual video frames.
+================================================================================
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict
+import math
+import json
+import subprocess
+import re
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import cv2
+
+# =============================================================================
+# CONFIG (EDIT EVERYTHING HERE)
+# =============================================================================
+CFG: Dict[str, object] = {
+    # -------------------------
+    # Paths
+    # -------------------------
+    "BASE_DIR": "/content/drive/MyDrive/deneme",
+    "MEDPC_FILE": "deneme.csv",
+    "BEHDATA_FILE": "BehData.csv",
+    "FIBER_FILE": "fiber.csv",
+    "VIDEO_FILE": "Abdullah.avi",
+    "OUT_DIR_NAME": "RUN_masterRealVideo_fromBehdata_alignDP_reportAllMedPCs",
+
+    # -------------------------
+    # Debug
+    # -------------------------
+    "USE_FAKE_VIDEO": False,  # True = no real video writing; uses a fake displayed timeline
+
+    # -------------------------
+    # MedPC input
+    # -------------------------
+    "MEDPC_COL": "self_administrator",
+    "MEDPC_DT_SEC": 1.0,      # multiply raw MedPC values by this to get seconds
+
+    # -------------------------
+    # Real-time trimming (applies to BehData REAL time AND Fiber time) then re-zero to MASTER
+    # -------------------------
+    "TRIM_START_SEC": 0.0,
+
+    # -------------------------
+    # Manual anchors (DISPLAYED video timeline, mm:ss.mmm). Uses START times only.
+    # -------------------------
+    "MANUAL_STARTS_TXT": [
+        "1:36.150",
+        "2:52.250",
+        "3:34.300",
+        "4:23.000",
+        "5:09.750",
+        "6:43.900",
+        "8:12.500",
+        "9:49.450",
+        "11:43.850",
+        "11:55.500",
+        "12:16.850",
+        "13:18.600",
+        "21:11.950",
+        "27:22.000",
+        "31:51.850",
+        "31:54.700",
+        "33:43.050",
+        "34:14.450",
+        "36:09.350",
+        "38:14.700",
+        "42:59.600",
+        "43:09.400",
+    ],
+
+    # -------------------------
+    # Alignment corridor / DP tuning (human scale)
+    # -------------------------
+    "MATCH_TOL_SEC": 1.5,          # W_CAND
+    "SKIP_MANUAL_PEN": 2.0,
+    "SKIP_MEDPC_PEN": 0.0,
+    "LAMBDA_NOISE": 0.35,
+
+    # -------------------------
+    # Coarse affine search grid (human scale)
+    # manual ≈ a * medpc + b
+    # -------------------------
+    "A_CENTER": 1.0,
+    "A_RANGE": 0.01,              # searches [A_CENTER - A_RANGE, A_CENTER + A_RANGE]
+    "A_STEP": 0.0005,
+    "B_STEP": 0.05,
+
+    # -------------------------
+    # Optional clock prior to constrain b search (human scale)
+    # b_prior = (MedPC_start_clock - Video_start_clock) - TRIM_START_SEC
+    # and we search b_prior ± B_PRIOR_PAD_SEC
+    # -------------------------
+    "MEDPC_START_CLOCK": "15:43:47",
+    "VIDEO_START_CLOCK": "15:44:43",
+    "B_PRIOR_PAD_SEC": 120.0,
+
+    # -------------------------
+    # Mild refit regularization (human scale)
+    # These are weights (NOT 1e-6). Larger = stronger pull.
+    # -------------------------
+    "RIDGE_A_TO_1_WEIGHT": 0.03,      # pulls slope a toward 1.0
+    "RIDGE_B_TO_PRIOR_WEIGHT": 0.001, # pulls intercept b toward b_prior
+
+    # -------------------------
+    # Event cleanup
+    # -------------------------
+    "CLUSTER_WIN_SEC": 0.0,
+
+    # -------------------------
+    # Fiber peri-event window
+    # -------------------------
+    "PRE_SEC": 5.0,
+    "POST_SEC": 5.0,
+    "BASE_START_SEC": -5.0,
+    "BASE_END_SEC": 0.0,
+    "PEAK_SEARCH_START_SEC": 0.0,
+    "PEAK_SEARCH_END_SEC": 5.0,
+
+    # -------------------------
+    # Clips (around peak time in MASTER)
+    # -------------------------
+    "CLIP_PRE_SEC": 5.0,
+    "CLIP_POST_SEC": 5.0,
+    "TARGET_CLIPS": 10,
+    "EVENT_REFRACTORY_SEC": 5.0,
+
+    # -------------------------
+    # Photobleach correction
+    # -------------------------
+    "PB_TAU_SEC": 60.0,
+
+    # -------------------------
+    # Reporting thresholds
+    # -------------------------
+    "NEAR_SEC": 1.5,   # label Near if within this to nearest manual anchor
+    "MID_SEC": 2.0,    # label Mid if within this (else Far)
+}
+
+# =============================================================================
+# OPTIONAL PROGRESS BAR
+# =============================================================================
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
+def _pbar(iterable=None, total=None, desc="", unit="", leave=True):
+    if tqdm is None:
+        return iterable if iterable is not None else range(int(total or 0))
+    return tqdm(iterable, total=total, desc=desc, unit=unit, leave=leave, mininterval=0.2)
+
+# =============================================================================
+# OPTIONAL GPU (CuPy)
+# =============================================================================
+try:
+    import cupy as cp
+    _GPU_OK = True
+except Exception:
+    cp = None
+    _GPU_OK = False
+
+def xp_backend(prefer_gpu: bool = True):
+    return cp if (prefer_gpu and _GPU_OK) else np
+
+# =============================================================================
+# Paths
+# =============================================================================
+base_dir = Path(str(CFG["BASE_DIR"]))
+medpc_file   = base_dir / str(CFG["MEDPC_FILE"])
+behdata_file = base_dir / str(CFG["BEHDATA_FILE"])
+fiber_file   = base_dir / str(CFG["FIBER_FILE"])
+video_file   = base_dir / str(CFG["VIDEO_FILE"])
+
+root = base_dir / str(CFG["OUT_DIR_NAME"])
+root.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# Helpers: time formatting / parsing
+# =============================================================================
+def parse_mmss_msec_to_seconds(s: str) -> float:
+    """
+    Accepts:
+      mm:ss.mmm
+      m:ss
+      mm:ss
+      tolerant to spaces
+    """
+    s = str(s).strip().replace(" ", "")
+    m = re.match(r"^(\d+):(\d+(?:\.\d+)?)$", s)
+    if m:
+        mm = int(m.group(1))
+        ss = float(m.group(2))
+        return mm * 60.0 + ss
+    # fallback: "mm.ss" style
+    if "." in s:
+        parts = s.split(".", 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            return int(parts[0]) * 60.0 + float(parts[1])
+    return float(s)
+
+def sec_to_mmss_mmm(t: float) -> str:
+    if not np.isfinite(t):
+        return "nan"
+    t = float(t)
+    if t < 0:
+        sign = "-"
+        t = -t
+    else:
+        sign = ""
+    mm = int(t // 60.0)
+    ss = t - 60.0 * mm
+    return f"{sign}{mm}:{ss:06.3f}"  # mm:ss.mmm
+
+def apply_trim_rezero(times_s: np.ndarray, trim_s: float) -> np.ndarray:
+    x = np.asarray(times_s, float) - float(trim_s)
+    x = x[np.isfinite(x)]
+    return np.sort(x[x >= 0.0])
+
+def cluster_events(times_s: np.ndarray, win_s: float) -> np.ndarray:
+    x = np.sort(np.asarray(times_s, float))
+    if x.size == 0:
+        return x
+    out = [float(x[0])]
+    last = float(x[0])
+    for t in x[1:]:
+        t = float(t)
+        if t - last > float(win_s):
+            out.append(t)
+            last = t
+    return np.array(out, dtype=float)
+
+# =============================================================================
+# Fiber helpers
+# =============================================================================
+def infer_fiber_cols(df: pd.DataFrame):
+    cols = list(df.columns)
+
+    def pick(name_list, fallback_idx):
+        for n in name_list:
+            if n in cols:
+                return n
+        return cols[fallback_idx] if len(cols) > fallback_idx else cols[0]
+
+    time_cands = [c for c in cols if "time" in c.lower()]
+    sig_cands  = [c for c in cols if ("sig" in c.lower()) or ("490" in c.lower())]
+    ctl_cands  = [c for c in cols if ("ctl" in c.lower()) or ("control" in c.lower()) or ("405" in c.lower()) or ("iso" in c.lower())]
+
+    time_col = pick(["TimeStamp", "Time(s)"], 0)
+    if time_col not in cols and time_cands:
+        time_col = time_cands[0]
+
+    sig_col = pick(["Signal"], 1)
+    if sig_col not in cols and sig_cands:
+        sig_col = sig_cands[0]
+
+    ctl_col = pick(["Control"], 2)
+    if ctl_col not in cols and ctl_cands:
+        ctl_col = ctl_cands[0]
+
+    return time_col, sig_col, ctl_col
+
+def normalize_to_seconds_by_dt(t_raw: np.ndarray):
+    t = np.asarray(t_raw, float)
+    t = t - np.nanmin(t)
+    dt = float(np.nanmedian(np.diff(np.sort(t))))
+    if not np.isfinite(dt) or dt <= 0:
+        return t, 1.0
+    fs = 1.0 / dt
+    scale = 1.0
+    # heuristics:
+    if fs > 50000:
+        scale = 1e-6
+    elif fs > 5000:
+        scale = 1e-3
+    elif fs < 50 and np.nanmax(t) > 20000:
+        scale = 1e-3
+    t2 = (t * scale).astype(float)
+    t2 = t2 - float(np.min(t2))
+    return t2, scale
+
+def photobleach_correct(sig: np.ndarray, ctl: np.ndarray, fs: float, tau_sec: float):
+    span = int(max(10, round(tau_sec * fs)))
+    s = pd.Series(sig)
+    c = pd.Series(ctl)
+    trend_sig = s.ewm(span=span, adjust=False).mean().to_numpy(dtype=float)
+    trend_ctl = c.ewm(span=span, adjust=False).mean().to_numpy(dtype=float)
+    eps = 1e-12
+    sig_n = sig / (trend_sig + eps)
+    ctl_n = ctl / (trend_ctl + eps)
+    return sig_n, ctl_n, trend_sig, trend_ctl
+
+# =============================================================================
+# Clock prior helper
+# =============================================================================
+def calculate_clock_offset(medpc_time: str, video_time: str) -> float:
+    """
+    Returns (t_medpc - t_video) in seconds.
+    Negative means MedPC started earlier than video.
+    """
+    fmt = "%H:%M:%S"
+    t_med = datetime.strptime(medpc_time, fmt)
+    t_vid = datetime.strptime(video_time, fmt)
+    return (t_med - t_vid).total_seconds()
+
+# =============================================================================
+# VIDEO: per-frame displayed PTS (VFR-safe)
+# =============================================================================
+def run_ffprobe_frame_pts(video_path: Path) -> Optional[np.ndarray]:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "frame=best_effort_timestamp_time",
+        "-of", "json",
+        str(video_path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
+        j = json.loads(out)
+        frames = j.get("frames", [])
+        pts = []
+        for fr in frames:
+            v = fr.get("best_effort_timestamp_time", None)
+            if v is None:
+                continue
+            try:
+                pts.append(float(v))
+            except Exception:
+                continue
+        if len(pts) < 10:
+            return None
+        pts = np.asarray(pts, dtype=float)
+        pts = np.maximum.accumulate(pts)
+        pts = pts - float(np.min(pts))
+        return pts
+    except Exception:
+        return None
+
+def get_video_meta(video_path: Path) -> Tuple[int, int, float]:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video file (codec).")
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps_meta = float(cap.get(cv2.CAP_PROP_FPS)) if np.isfinite(cap.get(cv2.CAP_PROP_FPS)) else float("nan")
+    cap.release()
+    return W, H, fps_meta
+
+def time_to_frame_idx(t_frame_s: np.ndarray, t_s: float) -> int:
+    """Nearest frame index for a given time on a monotonic frame timeline."""
+    if not np.isfinite(t_s):
+        return 0
+    t_s = float(t_s)
+    if t_s <= float(t_frame_s[0]):
+        return 0
+    if t_s >= float(t_frame_s[-1]):
+        return int(len(t_frame_s) - 1)
+    j = int(np.searchsorted(t_frame_s, t_s, side="left"))
+    if j <= 0:
+        return 0
+    if j >= len(t_frame_s):
+        return int(len(t_frame_s) - 1)
+    return j if abs(float(t_frame_s[j]) - t_s) < abs(float(t_frame_s[j - 1]) - t_s) else (j - 1)
+
+# =============================================================================
+# BEHDATA: parse frame index from Event like Cam11, Cam12, Cam111 ...
+# =============================================================================
+def parse_cam_event_to_frame(ev: str) -> Optional[int]:
+    """
+    Assumption:
+      Cam11 is 1st frame, Cam12 is 2nd frame, Cam111 is 11th frame ...
+      So 'Cam' + '1' + frameIndex.
+    """
+    if ev is None:
+        return None
+    ev = str(ev).strip()
+    m = re.search(r"(\d+)$", ev)
+    if not m:
+        return None
+    digits = m.group(1)
+    if len(digits) >= 2 and digits[0] == "1":
+        try:
+            return int(digits[1:])
+        except Exception:
+            return None
+    try:
+        return int(digits)
+    except Exception:
+        return None
+
+def load_behdata_real_timeline(csv_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      frame_no_sorted (frame numbers parsed from Event, usually 1-based-ish)
+      real_onset_sorted (seconds, re-zeroed)
+    """
+    df = pd.read_csv(csv_path)
+    if "Event" not in df.columns or "Onset" not in df.columns:
+        raise KeyError("BehData.csv must contain columns: Event, Onset (and optionally Offset).")
+
+    ev = df["Event"].astype(str).to_numpy()
+    onset = pd.to_numeric(df["Onset"], errors="coerce").to_numpy(dtype=float)
+
+    frame_no = np.array([parse_cam_event_to_frame(x) for x in ev], dtype=float)
+    good = np.isfinite(onset) & np.isfinite(frame_no) & (frame_no >= 1)
+    if good.sum() < 10:
+        raise RuntimeError("BehData parsing failed: too few valid rows. Check Event/Onset format.")
+
+    frame_no = frame_no[good].astype(int)
+    onset = onset[good].astype(float)
+
+    order = np.argsort(frame_no)
+    frame_no = frame_no[order]
+    onset = onset[order]
+
+    onset = np.maximum.accumulate(onset)
+    onset = onset - float(np.min(onset))  # re-zero real timeline at 0
+    return frame_no, onset
+
+# =============================================================================
+# Mapping: displayed video time <-> real video time
+# =============================================================================
+class VideoTimeWarp:
+    def __init__(self, t_disp: np.ndarray, t_real: np.ndarray):
+        self.t_disp = np.asarray(t_disp, float)
+        self.t_real = np.asarray(t_real, float)
+        n = min(len(self.t_disp), len(self.t_real))
+        if n < 10:
+            raise RuntimeError("VideoTimeWarp needs >=10 frames.")
+        self.t_disp = self.t_disp[:n]
+        self.t_real = self.t_real[:n]
+        self.t_disp = np.maximum.accumulate(self.t_disp)
+        self.t_real = np.maximum.accumulate(self.t_real)
+
+    def disp_to_frame(self, t_disp_s: float) -> int:
+        return time_to_frame_idx(self.t_disp, float(t_disp_s))
+
+    def disp_to_real(self, t_disp_s: float) -> float:
+        j = self.disp_to_frame(t_disp_s)
+        return float(self.t_real[j])
+
+    def real_to_frame(self, t_real_s: float) -> int:
+        return time_to_frame_idx(self.t_real, float(t_real_s))
+
+    def real_to_disp(self, t_real_s: float) -> float:
+        j = self.real_to_frame(t_real_s)
+        return float(self.t_disp[j])
+
+# =============================================================================
+# FEATURE: MedPC noise penalty
+# =============================================================================
+def medpc_noise_penalty(mapped_times: np.ndarray) -> np.ndarray:
+    x = np.asarray(mapped_times, float)
+    if x.size == 0:
+        return np.array([], dtype=float)
+    gap_prev = np.r_[np.inf, np.diff(x)]
+    gap_next = np.r_[np.diff(x), np.inf]
+    g = np.minimum(gap_prev, gap_next)
+    tau = 1.0
+    pen = np.exp(-np.clip(g, 0.0, 10.0) / tau)
+    pen = (pen - pen.min()) / (pen.max() - pen.min() + 1e-12)
+    return pen
+
+# =============================================================================
+# DP alignment
+# =============================================================================
+def dp_align_featured(
+    manual: np.ndarray,
+    mapped: np.ndarray,
+    noise_pen: np.ndarray,
+    tol: float,
+    skip_manual_pen: float,
+    skip_medpc_pen: float,
+    lambda_noise: float,
+):
+    m = np.sort(np.asarray(manual, float))
+    c = np.sort(np.asarray(mapped, float))
+    pn = np.asarray(noise_pen, float)
+    if len(pn) != len(c):
+        pn = np.zeros_like(c)
+
+    M, N = m.size, c.size
+    if M == 0:
+        return {"cost": 0.0, "pairs": [], "miss_manual": 0, "matches": 0}
+    if N == 0:
+        return {"cost": float(M) * skip_manual_pen, "pairs": [], "miss_manual": int(M), "matches": 0}
+
+    INF = 1e18
+    dp = np.full((M + 1, N + 1), INF, dtype=float)
+    bt = np.full((M + 1, N + 1), -1, dtype=int)  # 0 skip medpc, 1 skip manual, 2 match
+    dp[0, 0] = 0.0
+
+    for i in range(1, M + 1):
+        dp[i, 0] = dp[i - 1, 0] + skip_manual_pen
+        bt[i, 0] = 1
+    for j in range(1, N + 1):
+        dp[0, j] = dp[0, j - 1] + skip_medpc_pen
+        bt[0, j] = 0
+
+    for i in range(1, M + 1):
+        mi = float(m[i - 1])
+        for j in range(1, N + 1):
+            cj = float(c[j - 1])
+
+            best_cost = dp[i, j - 1] + skip_medpc_pen
+            best_step = 0
+
+            costB = dp[i - 1, j] + skip_manual_pen
+            if costB < best_cost:
+                best_cost = costB
+                best_step = 1
+
+            e = abs(mi - cj)
+            if e <= float(tol):
+                costC = dp[i - 1, j - 1] + e + lambda_noise * float(pn[j - 1])
+                if costC < best_cost:
+                    best_cost = costC
+                    best_step = 2
+
+            dp[i, j] = best_cost
+            bt[i, j] = best_step
+
+    pairs = []
+    i, j = M, N
+    miss_manual = 0
+    while i > 0 or j > 0:
+        step = bt[i, j]
+        if step == 0:
+            j -= 1
+        elif step == 1:
+            miss_manual += 1
+            i -= 1
+        elif step == 2:
+            pairs.append((i - 1, j - 1, abs(float(m[i - 1]) - float(c[j - 1]))))
+            i -= 1
+            j -= 1
+        else:
+            break
+    pairs.reverse()
+    return {"cost": float(dp[M, N]), "pairs": pairs, "miss_manual": int(miss_manual), "matches": int(len(pairs))}
+
+# =============================================================================
+# Coarse affine search
+# =============================================================================
+def coarse_affine_search(
+    manual: np.ndarray,
+    mp: np.ndarray,
+    a_center: float,
+    a_range: float,
+    a_step: float,
+    b_min: float,
+    b_max: float,
+    b_step: float,
+    tol: float,
+    skip_manual_pen: float,
+    skip_medpc_pen: float,
+    lambda_noise: float,
+):
+    manual = np.sort(np.asarray(manual, float))
+    mp = np.sort(np.asarray(mp, float))
+    if manual.size == 0 or mp.size == 0:
+        raise RuntimeError("coarse_affine_search needs non-empty manual and mp.")
+
+    a_list = np.arange(a_center - a_range, a_center + a_range + 1e-12, a_step)
+    b_list = np.arange(b_min, b_max + 1e-12, b_step)
+
+    best = None
+    total = int(len(a_list) * len(b_list))
+    p = tqdm(total=total, desc="[ALIGN] Coarse affine grid", unit="comb", leave=True, mininterval=0.2) if tqdm else None
+
+    for a in a_list:
+        for b in b_list:
+            mapped = a * mp + b
+            pn = medpc_noise_penalty(mapped)
+            out = dp_align_featured(
+                manual=manual,
+                mapped=mapped,
+                noise_pen=pn,
+                tol=tol,
+                skip_manual_pen=skip_manual_pen,
+                skip_medpc_pen=skip_medpc_pen,
+                lambda_noise=lambda_noise,
+            )
+            score = out["cost"] / max(1, len(manual))
+            if best is None or score < best["score"]:
+                best = {"a": float(a), "b": float(b), "score": float(score), "matches": out["matches"], "miss_manual": out["miss_manual"]}
+            if p is not None:
+                p.update(1)
+
+    if p is not None:
+        p.close()
+    return best
+
+def refit_affine_ridge(
+    mp_times: np.ndarray,
+    manual_times: np.ndarray,
+    pairs: List[Tuple[int, int, float]],
+    b_prior: float,
+    ridge_a_to_1_weight: float,
+    ridge_b_to_prior_weight: float,
+):
+    if len(pairs) < 3:
+        return None
+
+    mp = np.asarray(mp_times, float)
+    m = np.asarray(manual_times, float)
+
+    xs = []
+    ys = []
+    for (i_m, j_c, _) in pairs:
+        xs.append(float(mp[j_c]))
+        ys.append(float(m[i_m]))
+    x = np.asarray(xs, float)
+    y = np.asarray(ys, float)
+
+    A = np.c_[x, np.ones_like(x)]
+    t = y.copy()
+
+    # weights are human scale (e.g., 0.03, 0.001)
+    ra = math.sqrt(float(max(0.0, ridge_a_to_1_weight)))
+    rb = math.sqrt(float(max(0.0, ridge_b_to_prior_weight)))
+
+    A_aug = np.vstack([A, [ra, 0.0], [0.0, rb]])
+    t_aug = np.concatenate([t, [ra * 1.0, rb * float(b_prior)]])
+
+    sol, *_ = np.linalg.lstsq(A_aug, t_aug, rcond=None)
+    return float(sol[0]), float(sol[1]), len(pairs)
+
+def pairs_to_df(manual_times, mp_times, a, b, pairs):
+    rows = []
+    mapped = a * mp_times + b
+    pn = medpc_noise_penalty(mapped)
+    for (i_m, j_c, err) in pairs:
+        rows.append({
+            "manual_i": int(i_m),
+            "manual_t_master_s": float(manual_times[i_m]),
+            "medpc_j": int(j_c),
+            "medpc_t_raw_s": float(mp_times[j_c]),
+            "mapped_t_master_s": float(mapped[j_c]),
+            "abs_err_s": float(err),
+            "noise_pen": float(pn[j_c]),
+        })
+    return pd.DataFrame(rows)
+
+# =============================================================================
+# Peri-event GPU compute
+# =============================================================================
+def peri_event_robustz_and_peak_gpu(
+    t_fiber: np.ndarray,
+    dff: np.ndarray,
+    event_times: np.ndarray,
+    epoch: np.ndarray,
+    base_mask: np.ndarray,
+    search_mask: np.ndarray,
+    prefer_gpu: bool = True,
+):
+    xp = xp_backend(prefer_gpu=prefer_gpu)
+    t_x = xp.asarray(t_fiber, dtype=xp.float64)
+    d_x = xp.asarray(dff, dtype=xp.float64)
+    ev_x = xp.asarray(event_times, dtype=xp.float64)
+    ep_x = xp.asarray(epoch, dtype=xp.float64)
+
+    n_ev = int(ev_x.size)
+    n_ep = int(ep_x.size)
+    if n_ev == 0:
+        return np.zeros((0, n_ep)), np.array([]), np.array([])
+
+    q = (ev_x[:, None] + ep_x[None, :]).reshape(-1)
+    yq = xp.interp(q, t_x, d_x).reshape(n_ev, n_ep)
+
+    base = yq[:, base_mask]
+    med = xp.median(base, axis=1)
+    mad = xp.median(xp.abs(base - med[:, None]), axis=1)
+
+    mad_safe = xp.where(mad <= 0, xp.nan, mad)
+    rz = (yq - med[:, None]) / mad_safe[:, None]
+
+    zz = rz[:, search_mask]
+    zz2 = xp.nan_to_num(zz, nan=-xp.inf)
+    kmax = xp.argmax(zz2, axis=1)
+    peak_z = xp.take_along_axis(zz, kmax[:, None], axis=1).reshape(-1)
+
+    search_t = xp.asarray(epoch[search_mask], dtype=xp.float64)
+    peak_off = search_t[kmax]
+
+    if xp is cp:
+        return cp.asnumpy(rz), cp.asnumpy(peak_z), cp.asnumpy(peak_off)
+    return np.asarray(rz), np.asarray(peak_z), np.asarray(peak_off)
+
+def choose_top_indices(scores: np.ndarray, times_master: np.ndarray, refractory: float, max_keep: int = 400):
+    key = -np.nan_to_num(scores, nan=-1e9)
+    order = np.argsort(key)
+    chosen = []
+    used = []
+    for idx in order:
+        t0 = float(times_master[idx])
+        if any(abs(t0 - u) < refractory for u in used):
+            continue
+        chosen.append(int(idx))
+        used.append(t0)
+        if len(chosen) >= max_keep:
+            break
+    return np.array(chosen, dtype=int)
+
+# =============================================================================
+# OUTPUT DIRS
+# =============================================================================
+case_root = root / f"case_{CFG['MEDPC_COL']}"
+figdir = case_root / "figures"
+viddir = case_root / "videos_increase"
+valdir = case_root / "validation"
+aligndir = case_root / "alignment"
+repdir = case_root / "reports"
+for d in [case_root, figdir, viddir, valdir, aligndir, repdir]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# 1) Load BehData real timeline (frame -> real seconds)
+# =============================================================================
+frame_no, t_real_full = load_behdata_real_timeline(behdata_file)
+print(f"[BEHDATA] frames={len(t_real_full)} real_dur≈{t_real_full[-1]:.3f}s (re-zeroed)")
+
+# =============================================================================
+# 2) Load video displayed timeline (ffprobe pts per frame)
+# =============================================================================
+USE_FAKE_VIDEO = bool(CFG["USE_FAKE_VIDEO"])
+if USE_FAKE_VIDEO:
+    t_disp_full = np.arange(0, t_real_full[-1] * 0.75, 1/20.0)  # fake compressed displayed clock
+    W, H, fps_meta = 640, 480, 20.0
+else:
+    t_disp_full = run_ffprobe_frame_pts(video_file)
+    if t_disp_full is None:
+        raise RuntimeError("ffprobe frame pts failed. Install ffprobe or fix video.")
+    W, H, fps_meta = get_video_meta(video_file)
+
+# align lengths (video may have fewer frames than BehData or vice versa)
+n_common = min(len(t_disp_full), len(t_real_full))
+t_disp_full = t_disp_full[:n_common]
+t_real_full = t_real_full[:n_common]
+print(f"[VIDEO] frames={n_common} disp_dur≈{t_disp_full[-1]:.3f}s (compressed) | meta_fps={fps_meta}")
+
+warp = VideoTimeWarp(t_disp_full, t_real_full)
+
+# =============================================================================
+# 3) Trim in REAL time (BehData) and create trimmed arrays
+# =============================================================================
+TRIM_START_SEC = float(CFG["TRIM_START_SEC"])
+keep_real = t_real_full >= TRIM_START_SEC
+if int(np.sum(keep_real)) < 10:
+    raise RuntimeError("Too few frames after TRIM_START_SEC in REAL time. Lower TRIM_START_SEC.")
+
+start_frame_offset = int(np.argmax(keep_real))  # original frame index in the file
+t_real = t_real_full[keep_real] - TRIM_START_SEC   # MASTER video axis (REAL time, trimmed and re-zeroed)
+t_disp = t_disp_full[keep_real]                    # DISPLAYED times for same kept frames (not clock)
+
+real_video_dur = float(t_real[-1])
+print(f"[REAL-VIDEO] trim={TRIM_START_SEC:.3f}s -> real_video_dur≈{real_video_dur:.3f}s start_frame_offset={start_frame_offset}")
+
+# =============================================================================
+# 4) Manual anchors: DISPLAYED time -> REAL time -> trim+rezero => MASTER
+# =============================================================================
+manual_disp = np.array([parse_mmss_msec_to_seconds(x) for x in CFG["MANUAL_STARTS_TXT"]], dtype=float)
+manual_real = np.array([warp.disp_to_real(x) for x in manual_disp], dtype=float)     # real seconds since real start
+manual_master = apply_trim_rezero(manual_real, TRIM_START_SEC)                       # master axis
+print(f"[MANUAL] n={len(manual_master)} master range={manual_master.min():.2f}..{manual_master.max():.2f}s")
+
+# =============================================================================
+# 5) Load fiber -> trim -> dff
+# =============================================================================
+fdf = pd.read_csv(fiber_file)
+time_col, sig_col, ctl_col = infer_fiber_cols(fdf)
+
+t_raw = pd.to_numeric(fdf[time_col], errors="coerce")
+sig_raw = pd.to_numeric(fdf[sig_col], errors="coerce")
+ctl_raw = pd.to_numeric(fdf[ctl_col], errors="coerce")
+mask = t_raw.notna() & sig_raw.notna() & ctl_raw.notna()
+
+t_raw = t_raw[mask].to_numpy(dtype=float)
+sig_raw = sig_raw[mask].to_numpy(dtype=float)
+ctl_raw = ctl_raw[mask].to_numpy(dtype=float)
+
+t_sec0, t_scale = normalize_to_seconds_by_dt(t_raw)
+
+keep = t_sec0 >= TRIM_START_SEC
+t_full = t_sec0[keep] - TRIM_START_SEC
+sig_full = sig_raw[keep]
+ctl_full = ctl_raw[keep]
+
+dt = float(np.nanmedian(np.diff(t_full)))
+if not np.isfinite(dt) or dt <= 0:
+    raise RuntimeError("Fiber timestamps invalid (dt<=0) after trimming.")
+fs = 1.0 / dt
+fiber_dur = float(np.nanmax(t_full)) if t_full.size else 0.0
+
+print(f"[FIBER] scale={t_scale} trim={TRIM_START_SEC:.3f}s range={t_full.min():.3f}..{t_full.max():.3f}s Fs≈{fs:.3f}Hz")
+
+sig_n, ctl_n, trend_sig, trend_ctl = photobleach_correct(
+    sig_full, ctl_full, fs=fs, tau_sec=float(CFG["PB_TAU_SEC"])
+)
+a_fit, b_fit = np.polyfit(ctl_n, sig_n, 1)
+fit_ctl = a_fit * ctl_n + b_fit
+dff_full = (sig_n - fit_ctl) / (fit_ctl + 1e-12)
+
+# =============================================================================
+# 6) MASTER duration = min(real_video_dur, fiber_dur)
+# =============================================================================
+dur_master = float(min(real_video_dur, fiber_dur))
+if dur_master <= 0:
+    raise RuntimeError("Invalid master duration.")
+print(f"[MASTER] real_video_dur≈{real_video_dur:.3f}s fiber_dur≈{fiber_dur:.3f}s => dur_master≈{dur_master:.3f}s")
+
+# trim fiber to master
+m2 = (t_full <= dur_master) & np.isfinite(t_full) & np.isfinite(dff_full)
+t = t_full[m2]
+dff = dff_full[m2]
+
+PRE = float(CFG["PRE_SEC"])
+POST = float(CFG["POST_SEC"])
+epoch = np.arange(-PRE, POST + dt, dt)
+base_mask = (epoch >= float(CFG["BASE_START_SEC"])) & (epoch < float(CFG["BASE_END_SEC"]))
+search_mask = (epoch >= float(CFG["PEAK_SEARCH_START_SEC"])) & (epoch <= float(CFG["PEAK_SEARCH_END_SEC"]))
+
+# save photobleach plot
+pb_png = figdir / "photobleach_trends_master.png"
+plt.figure(figsize=(12, 5))
+plt.plot(t_full, sig_full, linewidth=0.7, alpha=0.7, label="Signal raw (trimmed)")
+plt.plot(t_full, trend_sig, linewidth=2.0, label=f"Signal EMA trend (tau={CFG['PB_TAU_SEC']}s)")
+plt.plot(t_full, ctl_full, linewidth=0.7, alpha=0.7, label="Control raw (trimmed)")
+plt.plot(t_full, trend_ctl, linewidth=2.0, label=f"Control EMA trend (tau={CFG['PB_TAU_SEC']}s)")
+plt.axvline(dur_master, linestyle="--", linewidth=1, label="dur_master")
+plt.xlabel("MASTER time (s)")
+plt.ylabel("Raw units")
+plt.title("Photobleach trends (master)")
+plt.legend()
+plt.tight_layout()
+plt.savefig(pb_png, dpi=200)
+plt.close()
+print(f"[OK] Saved: {pb_png}")
+
+# =============================================================================
+# 7) Load MedPC -> seconds -> cluster
+# =============================================================================
+bdf = pd.read_csv(medpc_file)
+MEDPC_COL = str(CFG["MEDPC_COL"])
+if MEDPC_COL not in bdf.columns:
+    raise KeyError(f"Column '{MEDPC_COL}' not found in {medpc_file.name}.")
+
+mp_raw = pd.to_numeric(bdf[MEDPC_COL], errors="coerce").dropna().to_numpy(dtype=float)
+mp_raw = mp_raw[mp_raw > 0]
+mp_raw = np.sort(mp_raw)
+
+mp_s = mp_raw * float(CFG["MEDPC_DT_SEC"])
+mp_s = cluster_events(mp_s, float(CFG["CLUSTER_WIN_SEC"]))
+mp_idx = np.arange(1, len(mp_s) + 1, dtype=int)
+print(f"[MEDPC] n={len(mp_s)} range={mp_s.min() if len(mp_s) else np.nan:.2f}..{mp_s.max() if len(mp_s) else np.nan:.2f}s")
+
+# =============================================================================
+# 8) Coarse affine alignment (manual_master vs mp_s) with clock prior
+# =============================================================================
+auto_b = calculate_clock_offset(str(CFG["MEDPC_START_CLOCK"]), str(CFG["VIDEO_START_CLOCK"]))
+b_prior = float(auto_b - TRIM_START_SEC)
+b_min = b_prior - float(CFG["B_PRIOR_PAD_SEC"])
+b_max = b_prior + float(CFG["B_PRIOR_PAD_SEC"])
+
+W_CAND = float(CFG["MATCH_TOL_SEC"])
+print(f"[CLOCK] b_prior(master)≈{b_prior:.3f}s search=[{b_min:.1f},{b_max:.1f}]  tol={W_CAND:.2f}s")
+
+coarse = coarse_affine_search(
+    manual=manual_master,
+    mp=mp_s,
+    a_center=float(CFG["A_CENTER"]),
+    a_range=float(CFG["A_RANGE"]),
+    a_step=float(CFG["A_STEP"]),
+    b_min=b_min, b_max=b_max, b_step=float(CFG["B_STEP"]),
+    tol=W_CAND,
+    skip_manual_pen=float(CFG["SKIP_MANUAL_PEN"]),
+    skip_medpc_pen=float(CFG["SKIP_MEDPC_PEN"]),
+    lambda_noise=float(CFG["LAMBDA_NOISE"]),
+)
+a0, b0 = float(coarse["a"]), float(coarse["b"])
+print(f"[COARSE] a={a0:.9f} b={b0:.3f} score={coarse['score']:.4f} matches={coarse['matches']} miss_manual={coarse['miss_manual']}")
+
+mapped0 = a0 * mp_s + b0
+pn0 = medpc_noise_penalty(mapped0)
+out0 = dp_align_featured(
+    manual=manual_master,
+    mapped=mapped0,
+    noise_pen=pn0,
+    tol=W_CAND,
+    skip_manual_pen=float(CFG["SKIP_MANUAL_PEN"]),
+    skip_medpc_pen=float(CFG["SKIP_MEDPC_PEN"]),
+    lambda_noise=float(CFG["LAMBDA_NOISE"]),
+)
+pairs0 = out0["pairs"]
+print(f"[DP0] cost={out0['cost']:.3f} matches={out0['matches']} miss_manual={out0['miss_manual']}")
+
+pairs_df0 = pairs_to_df(manual_master, mp_s, a0, b0, pairs0)
+pairs_df0.to_csv(aligndir / "matched_pairs_DP0.csv", index=False)
+
+# =============================================================================
+# 9) Refit affine once (mild ridge) + DP again
+# =============================================================================
+refit = refit_affine_ridge(
+    mp_s, manual_master, pairs0,
+    b_prior=b_prior,
+    ridge_a_to_1_weight=float(CFG["RIDGE_A_TO_1_WEIGHT"]),
+    ridge_b_to_prior_weight=float(CFG["RIDGE_B_TO_PRIOR_WEIGHT"]),
+)
+if refit is None:
+    a1, b1 = a0, b0
+    print("[REFIT] Not enough matches -> keep coarse affine.")
+else:
+    a1, b1, k = refit
+    print(f"[REFIT] a={a1:.9f} b={b1:.3f} from {k} matches (ridge weights: a->{CFG['RIDGE_A_TO_1_WEIGHT']}, b->{CFG['RIDGE_B_TO_PRIOR_WEIGHT']})")
+
+mapped1 = a1 * mp_s + b1
+pn1 = medpc_noise_penalty(mapped1)
+out1 = dp_align_featured(
+    manual=manual_master,
+    mapped=mapped1,
+    noise_pen=pn1,
+    tol=W_CAND,
+    skip_manual_pen=float(CFG["SKIP_MANUAL_PEN"]),
+    skip_medpc_pen=float(CFG["SKIP_MEDPC_PEN"]),
+    lambda_noise=float(CFG["LAMBDA_NOISE"]),
+)
+pairs1 = out1["pairs"]
+print(f"[DP1] cost={out1['cost']:.3f} matches={out1['matches']} miss_manual={out1['miss_manual']}")
+
+pairs_df1 = pairs_to_df(manual_master, mp_s, a1, b1, pairs1)
+pairs_df1.to_csv(aligndir / "matched_pairs_DP1.csv", index=False)
+
+# alignment plot
+if len(pairs_df1) > 0:
+    png = figdir / "alignment_manual_vs_mapped_DP1.png"
+    plt.figure(figsize=(10, 4))
+    plt.plot(pairs_df1["manual_t_master_s"].to_numpy(), pairs_df1["mapped_t_master_s"].to_numpy(), marker="o", linewidth=1)
+    mn = float(pairs_df1["manual_t_master_s"].min())
+    mx = float(pairs_df1["manual_t_master_s"].max())
+    plt.plot([mn, mx], [mn, mx], linestyle="--", linewidth=1, label="y=x")
+    plt.xlabel("Manual (MASTER real-video time, s)")
+    plt.ylabel("Matched MedPC mapped (MASTER, s)")
+    plt.title("Manual anchors vs matched MedPC mapped times (DP1)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png, dpi=200)
+    plt.close()
+    print(f"[OK] Saved: {png}")
+
+# =============================================================================
+# 10) REPORT: ALL MedPC points -> MASTER time -> VIDEO seconds (REAL + DISPLAYED) + nearest manual distance
+# =============================================================================
+def nearest_manual_info(manual_master_arr: np.ndarray, t_master: float) -> Tuple[int, float, float]:
+    """
+    Returns (manual_index, manual_time, abs_diff_sec).
+    manual_index is 0-based.
+    """
+    if manual_master_arr.size == 0 or not np.isfinite(t_master):
+        return -1, float("nan"), float("nan")
+    diffs = np.abs(manual_master_arr - float(t_master))
+    k = int(np.argmin(diffs))
+    return k, float(manual_master_arr[k]), float(diffs[k])
+
+def label_distance(d: float, near_sec: float, mid_sec: float) -> str:
+    if not np.isfinite(d):
+        return "NA"
+    if d <= near_sec:
+        return "NEAR"
+    if d <= mid_sec:
+        return "MID"
+    return "FAR"
+
+def master_to_displayed_sec(t_master: float) -> float:
+    """
+    MASTER time is REAL video time after trimming and re-zero.
+    We map MASTER -> frame (in trimmed arrays) -> displayed PTS in seconds.
+    """
+    if not np.isfinite(t_master):
+        return float("nan")
+    j = time_to_frame_idx(t_real, float(t_master))
+    return float(t_disp[j])
+
+# all mp mapped into master
+t_master_all = a1 * mp_s + b1  # can be <0 or >dur_master too; still report
+
+near_sec = float(CFG["NEAR_SEC"])
+mid_sec = float(CFG["MID_SEC"])
+
+rows = []
+for i in range(len(mp_s)):
+    t_master_i = float(t_master_all[i])
+    disp_i = master_to_displayed_sec(t_master_i) if (0.0 <= t_master_i <= float(t_real[-1])) else float("nan")
+
+    mi, mt, md = nearest_manual_info(manual_master, t_master_i)
+    lbl = label_distance(md, near_sec, mid_sec)
+
+    rows.append({
+        "nosepoke_index": int(mp_idx[i]),
+        "t_medpc_raw_s": float(mp_s[i]),
+        "t_master_s": t_master_i,
+
+        # video time readouts
+        "video_real_sec_master": t_master_i,  # MASTER == REAL video time after trim
+        "video_real_mmss": sec_to_mmss_mmm(t_master_i),
+        "video_displayed_sec": disp_i,         # compressed displayed timeline
+        "video_displayed_mmss": sec_to_mmss_mmm(disp_i),
+
+        # nearest manual
+        "nearest_manual_i": int(mi),
+        "nearest_manual_master_s": float(mt),
+        "nearest_manual_mmss": sec_to_mmss_mmm(mt),
+        "dist_to_manual_sec": float(md),
+        "dist_label": lbl,
+
+        # range flags
+        "in_master_range": bool(np.isfinite(t_master_i) and (0.0 <= t_master_i <= dur_master)),
+        "in_video_trim_range": bool(np.isfinite(t_master_i) and (0.0 <= t_master_i <= float(t_real[-1]))),
+
+        # affine params
+        "a_final": float(a1),
+        "b_final": float(b1),
+        "b_prior_master": float(b_prior),
+        "trim_start_sec": float(TRIM_START_SEC),
+        "match_tol_sec": float(W_CAND),
+    })
+
+all_medpc_report_df = pd.DataFrame(rows)
+all_medpc_report_csv = repdir / "report_all_medpc_points_video_seconds_and_manual_distance.csv"
+all_medpc_report_df.to_csv(all_medpc_report_csv, index=False)
+
+print("\n[REPORT] ALL MedPC points (first 20 rows):")
+print(all_medpc_report_df.head(20).to_string(index=False))
+print(f"\n[OK] Saved: {all_medpc_report_csv}")
+
+# =============================================================================
+# 11) Correct events into MASTER clock and filter for peri-event window
+# =============================================================================
+ok_master = (t_master_all >= 0.0) & (t_master_all <= dur_master) & np.isfinite(t_master_all)
+mp_ok = mp_s[ok_master]
+mp_ok_idx = mp_idx[ok_master]
+t_event_master = t_master_all[ok_master]
+print(f"\n[EVENTS] in master: n={len(t_event_master)} / {len(mp_s)}")
+
+# keep those that fit peri-window in fiber
+t_min = float(np.min(t)) if t.size else 0.0
+t_max = float(np.max(t)) if t.size else 0.0
+ok_fiber_window = (t_event_master - PRE >= t_min) & (t_event_master + POST <= t_max)
+mp_ok2 = mp_ok[ok_fiber_window]
+mp_ok_idx2 = mp_ok_idx[ok_fiber_window]
+t_event_master2 = t_event_master[ok_fiber_window]
+print(f"[PERI] usable events: n={len(t_event_master2)}")
+
+# =============================================================================
+# 12) Peri-event robustZ + peak
+# =============================================================================
+rz_trials, peak_z, peak_off = peri_event_robustz_and_peak_gpu(
+    t_fiber=t,
+    dff=dff,
+    event_times=t_event_master2,
+    epoch=epoch,
+    base_mask=base_mask,
+    search_mask=search_mask,
+    prefer_gpu=True,
+)
+t_peak_master = t_event_master2 + peak_off
+
+# =============================================================================
+# 13) Clip feasibility using REAL-video timeline (BehData trimmed)
+# =============================================================================
+real_video_dur_trim = float(t_real[-1])
+CLIP_PRE = float(CFG["CLIP_PRE_SEC"])
+CLIP_POST = float(CFG["CLIP_POST_SEC"])
+
+ok_video = (t_peak_master - CLIP_PRE >= 0.0) & (t_peak_master + CLIP_POST <= real_video_dur_trim) & np.isfinite(t_peak_master)
+print(f"[CLIPS] usable in real-video timeline: n={int(np.sum(ok_video))}")
+
+# events CSV (only those in peri window)
+all_events_df = pd.DataFrame({
+    "nosepoke_index": mp_ok_idx2.astype(int),
+    "t_medpc_raw_s": mp_ok2.astype(float),
+    "t_master_event_s": t_event_master2.astype(float),
+
+    "video_displayed_event_s": np.array([master_to_displayed_sec(x) for x in t_event_master2], dtype=float),
+    "video_displayed_event_mmss": [sec_to_mmss_mmm(master_to_displayed_sec(x)) for x in t_event_master2],
+
+    "peak_increase_robust_z": peak_z.astype(float),
+    "peak_increase_offset_s": peak_off.astype(float),
+    "t_master_peak_s": t_peak_master.astype(float),
+
+    "video_displayed_peak_s": np.array([master_to_displayed_sec(x) for x in t_peak_master], dtype=float),
+    "video_displayed_peak_mmss": [sec_to_mmss_mmm(master_to_displayed_sec(x)) for x in t_peak_master],
+
+    "usable_in_video": ok_video.astype(bool),
+
+    "a_final": float(a1),
+    "b_final": float(b1),
+    "b_prior_master": float(b_prior),
+    "trim_start_sec": float(TRIM_START_SEC),
+    "match_tol_sec": float(W_CAND),
+    "lambda_noise": float(CFG["LAMBDA_NOISE"]),
+    "skip_manual_pen": float(CFG["SKIP_MANUAL_PEN"]),
+    "fiber_fs_hz": float(fs),
+    "master_duration_s": float(dur_master),
+    "real_video_duration_s": float(real_video_dur_trim),
+    "video_displayed_duration_s": float(t_disp[-1]) if len(t_disp) else float("nan"),
+    "frames_used": int(len(t_real)),
+    "start_frame_offset": int(start_frame_offset),
+})
+all_events_csv = case_root / "all_events_corrected_master_increase_only.csv"
+all_events_df.to_csv(all_events_csv, index=False)
+print(f"[OK] Saved: {all_events_csv}")
+
+# =============================================================================
+# 14) TOP CLIPS selection (refractory)
+# =============================================================================
+chosen = choose_top_indices(peak_z, t_event_master2, float(CFG["EVENT_REFRACTORY_SEC"]), max_keep=400)
+valid = []
+for idx0 in chosen:
+    if not ok_video[idx0]:
+        continue
+    valid.append((idx0, float(t_peak_master[idx0]), float(t_event_master2[idx0])))
+    if len(valid) >= int(CFG["TARGET_CLIPS"]):
+        break
+print(f"[OK] Valid INCREASE clips: n={len(valid)} (target={CFG['TARGET_CLIPS']})")
+
+summary_rows = []
+for rank, (idx0, tpk, tev) in enumerate(valid[:10], start=1):
+    summary_rows.append({
+        "rank": rank,
+        "nosepoke_index": int(mp_ok_idx2[idx0]),
+        "t_medpc_raw_s": float(mp_ok2[idx0]),
+        "t_master_event_s": float(tev),
+        "t_master_peak_s": float(tpk),
+        "video_displayed_peak_s": float(master_to_displayed_sec(tpk)),
+        "video_displayed_peak_mmss": sec_to_mmss_mmm(master_to_displayed_sec(tpk)),
+        "peak_increase_robust_z": float(peak_z[idx0]),
+        "peak_increase_offset_s": float(peak_off[idx0]),
+        "a_final": float(a1),
+        "b_final": float(b1),
+        "trim_start_sec": float(TRIM_START_SEC),
+        "dur_master_s": float(dur_master),
+        "gpu_cupy_available": bool(_GPU_OK),
+    })
+summary_df = pd.DataFrame(summary_rows)
+summary_csv = case_root / "top10_increase_summary.csv"
+summary_df.to_csv(summary_csv, index=False)
+print(f"[OK] Saved: {summary_csv}")
+
+# =============================================================================
+# 15) Plot top10 peri-event
+# =============================================================================
+grid_png = figdir / "top10_peri_event_robustZ_grid_increase.png"
+if len(valid) > 0:
+    plt.figure(figsize=(18, 6))
+    ncols = 5
+    nrows = int(math.ceil(min(len(valid), 10) / ncols))
+    for j, (idx0, _, _) in enumerate(valid[:10], start=1):
+        ax = plt.subplot(nrows, ncols, j)
+        ax.plot(epoch, rz_trials[idx0], linewidth=1)
+        ax.axvline(0, linestyle="--", linewidth=1)
+        ax.axvline(float(peak_off[idx0]), linestyle=":", linewidth=1)
+        ax.set_title(
+            f"INC #{j} | Z={peak_z[idx0]:.2f} | NP#{int(mp_ok_idx2[idx0])} | "
+            f"ev={t_event_master2[idx0]:.1f}s | off={peak_off[idx0]:.2f}s"
+        )
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Robust Z (dF/F)")
+        ax.set_xlim(-PRE, POST)
+    plt.tight_layout()
+    plt.savefig(grid_png, dpi=200)
+    plt.close()
+    print(f"[OK] Saved: {grid_png}")
+
+# =============================================================================
+# 16) WRITE CLIPS (MASTER(real) time -> frame idx via BehData -> seek in video)
+# =============================================================================
+def write_increase_clips_behdata(valid_list, out_dir: Path):
+    if USE_FAKE_VIDEO:
+        print("[FAKE VIDEO] skipping clip writing")
+        return
+
+    cap = cv2.VideoCapture(str(video_file))
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video file (codec).")
+
+    fps_out = float(fps_meta) if np.isfinite(fps_meta) and fps_meta > 1 else 20.0
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    clip_iter = _pbar(list(enumerate(valid_list, start=1)), desc="[VIDEO] Writing clips (behdata warp)", unit="clip", leave=True)
+
+    for rank, (idx0, tpk_master, tev_master) in clip_iter:
+        start_t = float(tpk_master - CLIP_PRE)
+        end_t   = float(tpk_master + CLIP_POST)
+
+        start_fr_trim = time_to_frame_idx(t_real, start_t)
+        end_fr_trim   = time_to_frame_idx(t_real, end_t)
+
+        start_fr_trim = max(0, min(int(start_fr_trim), int(len(t_real) - 1)))
+        end_fr_trim   = max(0, min(int(end_fr_trim), int(len(t_real) - 1)))
+        if end_fr_trim < start_fr_trim:
+            start_fr_trim, end_fr_trim = end_fr_trim, start_fr_trim
+
+        start_fr = int(start_frame_offset + start_fr_trim)
+        end_fr   = int(start_frame_offset + end_fr_trim)
+
+        out_clip = out_dir / f"{rank}.mp4"
+        writer = cv2.VideoWriter(str(out_clip), fourcc, fps_out, (W, H))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_fr))
+        cur = int(start_fr)
+
+        np_index = int(mp_ok_idx2[idx0])
+        t_medpc_raw = float(mp_ok2[idx0])
+        zpk = float(peak_z[idx0])
+        pkoff = float(peak_off[idx0])
+
+        disp_peak = float(master_to_displayed_sec(tpk_master))
+        disp_event = float(master_to_displayed_sec(tev_master))
+
+        frames_to_write = int(end_fr - start_fr + 1)
+        p = tqdm(total=frames_to_write, desc=f"  clip {rank} frames", unit="fr", leave=False, mininterval=0.3) if tqdm else None
+
+        while cur <= int(end_fr):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            line1 = f"{MEDPC_COL} | INCREASE | Clip {rank} | PeakZ={zpk:.2f}"
+            line2 = f"PeakT REAL(master)={tpk_master:.2f}s ({sec_to_mmss_mmm(tpk_master)}) | DISPLAYED={disp_peak:.2f}s ({sec_to_mmss_mmm(disp_peak)})"
+            line3 = f"EventT REAL(master)={tev_master:.2f}s ({sec_to_mmss_mmm(tev_master)}) | DISPLAYED={disp_event:.2f}s ({sec_to_mmss_mmm(disp_event)})"
+            line4 = f"MedPCraw={t_medpc_raw:.2f}s | NP#{np_index} | PeakOff={pkoff:.2f}s | trim={TRIM_START_SEC:.1f}s | a={a1:.6f} b={b1:.2f}"
+
+            cv2.putText(frame, line1, (20, 40),  cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, line2, (20, 72),  cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, line3, (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(frame, line4, (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+
+            writer.write(frame)
+            cur += 1
+            if p is not None:
+                p.update(1)
+
+        if p is not None:
+            p.close()
+        writer.release()
+        print(f"[OK] Clip saved: {out_clip} (master-real {start_t:.3f}..{end_t:.3f}s) frames {start_fr}..{end_fr}")
+
+    cap.release()
+
+write_increase_clips_behdata(valid, viddir)
+
+# =============================================================================
+# 17) Validation report (text)
+# =============================================================================
+val_report = valdir / "validation_report.txt"
+with open(val_report, "w", encoding="utf-8") as f:
+    f.write("VALIDATION REPORT (BehData real-video clock + Featured DP + Report All MedPC)\n\n")
+    f.write("CONFIG (key params):\n")
+    f.write(f"  TRIM_START_SEC = {TRIM_START_SEC}\n")
+    f.write(f"  MATCH_TOL_SEC = {W_CAND}\n")
+    f.write(f"  A search: center={CFG['A_CENTER']} range=±{CFG['A_RANGE']} step={CFG['A_STEP']}\n")
+    f.write(f"  B search: step={CFG['B_STEP']} prior_pad={CFG['B_PRIOR_PAD_SEC']}\n")
+    f.write(f"  ridge weights: a->1 {CFG['RIDGE_A_TO_1_WEIGHT']} | b->prior {CFG['RIDGE_B_TO_PRIOR_WEIGHT']}\n")
+    f.write(f"  near/mid: {CFG['NEAR_SEC']} / {CFG['MID_SEC']}\n\n")
+
+    f.write("Durations:\n")
+    f.write(f"  MASTER duration ≈ {dur_master:.6f} s\n")
+    f.write(f"  REAL video duration (trim) ≈ {real_video_dur_trim:.6f} s\n")
+    f.write(f"  Displayed video duration (trim) ≈ {float(t_disp[-1]) if len(t_disp) else float('nan'):.6f} s\n")
+    f.write(f"  Fiber duration (trim) ≈ {fiber_dur:.6f} s\n\n")
+
+    f.write("Affine:\n")
+    f.write(f"  b_prior(master) = {b_prior:.6f}\n")
+    f.write(f"  coarse a,b = {a0:.12f}, {b0:.6f}\n")
+    f.write(f"  final  a,b = {a1:.12f}, {b1:.6f}\n\n")
+
+    f.write("DP:\n")
+    f.write(f"  DP0 matches={out0['matches']} miss_manual={out0['miss_manual']} cost={out0['cost']:.3f}\n")
+    f.write(f"  DP1 matches={out1['matches']} miss_manual={out1['miss_manual']} cost={out1['cost']:.3f}\n\n")
+
+    f.write(f"CuPy available: {_GPU_OK}\n\n")
+
+    f.write("Frame alignment:\n")
+    f.write(f"  frames_used = {n_common}\n")
+    f.write(f"  start_frame_offset = {start_frame_offset}\n\n")
+
+    f.write("Outputs:\n")
+    f.write(f"  all_medpc_report_csv = {all_medpc_report_csv}\n")
+    f.write(f"  all_events_csv = {all_events_csv}\n")
+    f.write(f"  top10_summary_csv = {summary_csv}\n")
+
+print(f"[OK] Saved: {val_report}")
+print(f"[DONE] Outputs: {case_root}")
