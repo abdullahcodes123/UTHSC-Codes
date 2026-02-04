@@ -1,0 +1,12 @@
+% Get handle to current figure
+f = gcf;
+
+% Make the window square on screen (e.g., 600×600 pixels)
+f.Units = 'pixels';
+f.Position(3:4) = [600 600];   % [width height]
+
+% Optional: make the printed/exported figure square as well
+f.PaperUnits    = 'inches';
+f.PaperPosition = [0 0 4 4];   % 4×4 inch square
+f.PaperSize     = [4 4];
+>> figure;
