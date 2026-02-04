@@ -1,0 +1,7 @@
+subplot(2,1,1)  % or whatever your subplot configuration is
+% ... your plotting code ...
+axis square  % This makes the current axis square
+
+subplot(2,1,2)
+% ... your plotting code ...
+axis square  % This makes the current axis square
