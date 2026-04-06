@@ -1,0 +1,19 @@
+library(readxl)
+
+df <- read_excel("/Users/abdullah/Desktop/new_lab/SANSA/adult_female_cacna1c.xlsx")
+
+plot_df <- df[, c("SAIR", "DeIR")]
+plot_df <- subset(plot_df, !is.na(SAIR) & !is.na(DeIR) & SAIR > 0 & DeIR > 0)
+
+plot(
+    plot_df$SAIR,
+    plot_df$DeIR,
+    log = "xy",
+    pch = 1,
+    col = "deeppink3",
+    cex = 1.2,
+    lwd = 2,
+    xlab = "Nicotine self-administrators",
+    ylab = "Demonstrators",
+    main = "Nose pokes by dyads"
+)
