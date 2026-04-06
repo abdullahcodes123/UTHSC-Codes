@@ -1,0 +1,126 @@
+library(readxl)
+library(dplyr)
+library(ggplot2)
+
+df <- read_excel("/Users/abdullah/Desktop/new_lab/SANSA/adult_female_cacna1c.xlsx")
+
+summary_df <- df %>%
+  group_by(DAY) %>%
+  summarise(
+    active_mean   = mean(`Saccarine Lick`, na.rm = TRUE),
+    active_sem    = sd(`Saccarine Lick`, na.rm = TRUE) / sqrt(sum(!is.na(`Saccarine Lick`))),
+    inactive_mean = mean(`Inactive Lick`, na.rm = TRUE),
+    inactive_sem  = sd(`Inactive Lick`, na.rm = TRUE) / sqrt(sum(!is.na(`Inactive Lick`))),
+    infusion_mean = mean(`Nicotine Injection`, na.rm = TRUE),
+    infusion_sem  = sd(`Nicotine Injection`, na.rm = TRUE) / sqrt(sum(!is.na(`Nicotine Injection`))),
+    .groups = "drop"
+  )
+
+summary_df$DayNum <- seq_len(nrow(summary_df))
+summary_df$DayLabel <- paste("Day", summary_df$DayNum)
+
+plot_df <- bind_rows(
+  data.frame(
+    DayNum = summary_df$DayNum,
+    DayLabel = summary_df$DayLabel,
+    Mean = summary_df$active_mean,
+    SEM = summary_df$active_sem,
+    Group = "Active licks"
+  ),
+  data.frame(
+    DayNum = summary_df$DayNum,
+    DayLabel = summary_df$DayLabel,
+    Mean = summary_df$inactive_mean,
+    SEM = summary_df$inactive_sem,
+    Group = "Inactive licks"
+  ),
+  data.frame(
+    DayNum = summary_df$DayNum,
+    DayLabel = summary_df$DayLabel,
+    Mean = summary_df$infusion_mean,
+    SEM = summary_df$infusion_sem,
+    Group = "Infusions"
+  )
+)
+
+plot_df$Group <- factor(
+  plot_df$Group,
+  levels = c("Active licks", "Inactive licks", "Infusions")
+)
+
+removed_df <- plot_df %>%
+  filter(is.na(Mean) | is.na(SEM) | Mean <= 0)
+
+if (nrow(removed_df) > 0) {
+  cat("\nThese rows were excluded from plotting:\n")
+  print(removed_df)
+} else {
+  cat("\nNo rows were excluded from plotting.\n")
+}
+
+plot_df_clean <- plot_df %>%
+  filter(!is.na(Mean), !is.na(SEM), Mean > 0)
+
+p <- ggplot(plot_df_clean, aes(x = DayNum, y = Mean, group = Group)) +
+  geom_errorbar(
+    aes(ymin = Mean - SEM, ymax = Mean + SEM, color = Group),
+    width = 0.15,
+    linewidth = 0.8
+  ) +
+  geom_line(
+    aes(color = Group, linetype = Group),
+    linewidth = 1
+  ) +
+  geom_point(
+    aes(shape = Group, fill = Group, color = Group),
+    size = 5,
+    stroke = 1.2
+  ) +
+  scale_x_continuous(
+    breaks = summary_df$DayNum,
+    labels = summary_df$DayLabel,
+    expand = expansion(mult = c(0.02, 0.12))
+  ) +
+  scale_y_log10() +
+  scale_shape_manual(values = c(
+    "Active licks" = 16,
+    "Inactive licks" = 21,
+    "Infusions" = 15
+  )) +
+  scale_fill_manual(values = c(
+    "Active licks" = "#9c1f5b",
+    "Inactive licks" = "white",
+    "Infusions" = "#9c1f5b"
+  )) +
+  scale_color_manual(values = c(
+    "Active licks" = "#9c1f5b",
+    "Inactive licks" = "black",
+    "Infusions" = "#9c1f5b"
+  )) +
+  scale_linetype_manual(values = c(
+    "Active licks" = "dashed",
+    "Inactive licks" = "dashed",
+    "Infusions" = "dashed"
+  )) +
+  labs(
+    x = NULL,
+    y = "Number of infusions or licks / 2.5 h",
+    shape = NULL,
+    fill = NULL,
+    color = NULL,
+    linetype = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = c(1.0, 0.88),
+    legend.justification = c(0, 1),
+    legend.background = element_blank(),
+    legend.key = element_blank(),
+    plot.margin = margin(10, 120, 10, 10)
+  )
+
+print(p)
