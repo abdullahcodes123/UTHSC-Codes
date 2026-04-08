@@ -4,7 +4,7 @@ library(ggplot2)
 
 df <- read_excel("/Users/abdullah/Desktop/new_lab/SANSA/adult_female_cacna1c.xlsx")
 
-summary_df <- df %>%
+summary_df <- df %>% #calculating mean of spout licks and their standard error of mean (SEM)
   group_by(DAY) %>%
   summarise(
     active_mean   = mean(`Saccarine Lick`, na.rm = TRUE),
