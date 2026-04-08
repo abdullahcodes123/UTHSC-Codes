@@ -4,7 +4,10 @@ library(ggplot2)
 
 df <- read_excel("/Users/abdullah/Desktop/new_lab/SANSA/adult_female_cacna1c.xlsx")
 
-summary_df <- df %>% #calculating mean of spout licks and their standard error of mean (SEM)
+#convert to date to DAY 1, 2 .. format at the end, at the beginning it excludes time, only day information remains with the date function. 
+# It calculates the mean and the standard error of the mean
+summary_df <- df %>% 
+  mutate(DAY = as.Date(DAY)) %>%
   group_by(DAY) %>%
   summarise(
     active_mean   = mean(`Saccarine Lick`, na.rm = TRUE),
@@ -14,11 +17,13 @@ summary_df <- df %>% #calculating mean of spout licks and their standard error o
     infusion_mean = mean(`Nicotine Injection`, na.rm = TRUE),
     infusion_sem  = sd(`Nicotine Injection`, na.rm = TRUE) / sqrt(sum(!is.na(`Nicotine Injection`))),
     .groups = "drop"
+  ) %>%
+  arrange(DAY) %>%
+  mutate(
+    DayNum = row_number(),
+    DayLabel = paste("Day", DayNum)
   )
-
-summary_df$DayNum <- seq_len(nrow(summary_df))
-summary_df$DayLabel <- paste("Day", summary_df$DayNum)
-
+# binds_rows function helps to clear data, leading to all data for each day being assigned to a table. New columns named as day num, day label, mean, sem, group
 plot_df <- bind_rows(
   data.frame(
     DayNum = summary_df$DayNum,
@@ -42,12 +47,12 @@ plot_df <- bind_rows(
     Group = "Infusions"
   )
 )
-
+#legend order and data color order
 plot_df$Group <- factor(
   plot_df$Group,
   levels = c("Active licks", "Inactive licks", "Infusions")
 )
-
+# remove NA data and print what has been removed.
 removed_df <- plot_df %>%
   filter(is.na(Mean) | is.na(SEM) | Mean <= 0)
 
