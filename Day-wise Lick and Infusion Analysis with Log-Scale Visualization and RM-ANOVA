@@ -1,0 +1,417 @@
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(ez)
+
+# =========================
+# Working directory
+# =========================
+setwd("/Users/abdullah/Desktop/new_lab/SANSA/")
+
+# =========================
+# Files to process
+# =========================
+files <- c("adolescent_wild.xlsx", "adult_cacna1c.xlsx")
+
+# =========================
+# Safe date parser
+# =========================
+parse_mixed_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  
+  # Excel numeric dates
+  if (is.numeric(x)) {
+    return(as.Date(x, origin = "1899-12-30"))
+  }
+  
+  x <- as.character(x)
+  x <- trimws(x)
+  
+  # try multiple common formats
+  out <- suppressWarnings(as.Date(x, format = "%Y-%m-%d"))
+  
+  idx <- is.na(out)
+  out[idx] <- suppressWarnings(as.Date(x[idx], format = "%m/%d/%Y"))
+  
+  idx <- is.na(out)
+  out[idx] <- suppressWarnings(as.Date(x[idx], format = "%d/%m/%Y"))
+  
+  idx <- is.na(out)
+  out[idx] <- suppressWarnings(as.Date(x[idx], format = "%m-%d-%Y"))
+  
+  idx <- is.na(out)
+  out[idx] <- suppressWarnings(as.Date(x[idx], format = "%d-%m-%Y"))
+  
+  idx <- is.na(out)
+  out[idx] <- suppressWarnings(as.Date(x[idx], format = "%Y/%m/%d"))
+  
+  return(out)
+}
+
+# =========================
+# Main analysis function
+# =========================
+analyze_file <- function(file_name, min_subjects_per_day = 2) {
+  
+  cat("\n===============================\n")
+  cat("Processing file:", file_name, "\n")
+  cat("===============================\n")
+  
+  df <- read_excel(file_name)
+  
+  cat("\nColumns detected:\n")
+  print(names(df))
+  
+  # -------------------------
+  # Clean / parse date safely
+  # -------------------------
+  df <- df %>%
+    mutate(
+      zdate = parse_mixed_date(zdate),
+      AID = as.factor(AID)
+    ) %>%
+    filter(!is.na(zdate), !is.na(AID))
+  
+  if (nrow(df) == 0) {
+    cat("\nNo valid rows after cleaning. Skipping file.\n")
+    return(NULL)
+  }
+  
+  # -------------------------
+  # Create ordered day labels
+  # -------------------------
+  day_map <- df %>%
+    distinct(zdate) %>%
+    arrange(zdate) %>%
+    mutate(
+      DayNum = row_number(),
+      DayLabel = paste("Day", DayNum)
+    )
+  
+  df <- df %>%
+    left_join(day_map, by = "zdate")
+  
+  cat("\nDetected days in file:\n")
+  print(day_map)
+  
+  # -------------------------
+  # Summary for plotting
+  # SEM can be NA if only one animal exists that day
+  # Keep those rows for plotting points/lines
+  # -------------------------
+  summary_df <- df %>%
+    group_by(zdate, DayNum, DayLabel) %>%
+    summarise(
+      n_active   = sum(!is.na(sacclick)),
+      n_water    = sum(!is.na(waterlick)),
+      n_infusion = sum(!is.na(Infusions)),
+      
+      active_mean   = mean(sacclick, na.rm = TRUE),
+      active_sem    = ifelse(n_active > 1,
+                             sd(sacclick, na.rm = TRUE) / sqrt(n_active),
+                             NA_real_),
+      
+      inactive_mean = mean(waterlick, na.rm = TRUE),
+      inactive_sem  = ifelse(n_water > 1,
+                             sd(waterlick, na.rm = TRUE) / sqrt(n_water),
+                             NA_real_),
+      
+      infusion_mean = mean(Infusions, na.rm = TRUE),
+      infusion_sem  = ifelse(n_infusion > 1,
+                             sd(Infusions, na.rm = TRUE) / sqrt(n_infusion),
+                             NA_real_),.groups = "drop"
+    ) %>%
+    arrange(DayNum)
+  
+  # -------------------------
+  # Prepare plotting table
+  # -------------------------
+  plot_df <- bind_rows(
+    data.frame(
+      DayNum = summary_df$DayNum,
+      DayLabel = summary_df$DayLabel,
+      Mean = summary_df$active_mean,
+      SEM = summary_df$active_sem,
+      Group = "Active licks"
+    ),
+    data.frame(
+      DayNum = summary_df$DayNum,
+      DayLabel = summary_df$DayLabel,
+      Mean = summary_df$inactive_mean,
+      SEM = summary_df$inactive_sem,
+      Group = "Inactive licks"
+    ),
+    data.frame(
+      DayNum = summary_df$DayNum,
+      DayLabel = summary_df$DayLabel,
+      Mean = summary_df$infusion_mean,
+      SEM = summary_df$infusion_sem,
+      Group = "Infusions"
+    )
+  )
+  
+  plot_df$Group <- factor(
+    plot_df$Group,
+    levels = c("Active licks", "Inactive licks", "Infusions")
+  )
+  
+  # Sadece Mean NA veya <=0 olanları çıkar
+  removed_df <- plot_df %>%
+    filter(is.na(Mean) | Mean <= 0)
+  
+  if (nrow(removed_df) > 0) {
+    cat("\nThese rows were excluded from plotting (Mean NA or <= 0):\n")
+    print(removed_df)
+  } else {
+    cat("\nNo rows were excluded from plotting.\n")
+  }
+  
+  plot_df_clean <- plot_df %>%
+    filter(!is.na(Mean), Mean > 0)
+  
+  # error bar only where SEM exists
+  plot_df_err <- plot_df_clean %>%
+    filter(!is.na(SEM))
+  
+  # -------------------------
+  # Plot
+  # -------------------------
+  p <- ggplot(plot_df_clean, aes(x = DayNum, y = Mean, group = Group)) +
+    geom_errorbar(
+      data = plot_df_err,
+      aes(ymin = Mean - SEM, ymax = Mean + SEM, color = Group),
+      width = 0.15,
+      linewidth = 0.8
+    ) +
+    geom_line(
+      aes(color = Group, linetype = Group),
+      linewidth = 1
+    ) +
+    geom_point(
+      aes(shape = Group, fill = Group, color = Group),
+      size = 5,
+      stroke = 1.2
+    ) +
+    scale_x_continuous(
+      breaks = summary_df$DayNum,
+      labels = summary_df$DayLabel,
+      expand = expansion(mult = c(0.02, 0.12))
+    ) +
+    scale_y_log10() +
+    scale_shape_manual(values = c(
+      "Active licks" = 16,
+      "Inactive licks" = 21,
+      "Infusions" = 15
+    )) +
+    scale_fill_manual(values = c(
+      "Active licks" = "#9c1f5b",
+      "Inactive licks" = "white",
+      "Infusions" = "#9c1f5b"
+    )) +
+    scale_color_manual(values = c(
+      "Active licks" = "#9c1f5b",
+      "Inactive licks" = "black",
+      "Infusions" = "#9c1f5b"
+    )) +
+    scale_linetype_manual(values = c(
+      "Active licks" = "dashed",
+      "Inactive licks" = "dashed",
+      "Infusions" = "dashed"
+    )) +
+    labs(
+      title = file_name,
+      x = NULL,
+      y = "Number of infusions or licks / 2.5 h",
+      shape = NULL,
+      fill = NULL,
+      color = NULL,
+      linetype = NULL
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.title.y = element_text(face = "bold"),
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = c(1.0, 0.88),
+      legend.justification = c(0, 1),
+      legend.background = element_blank(),
+      legend.key = element_blank(),
+      plot.margin = margin(10, 120, 10, 10)
+    )
+  
+  print(p)
+  
+  # -------------------------
+  # Prepare repeated measures data
+  # Collapse duplicates within AID x DayNum
+  # -------------------------
+  rm_df <- df %>%
+    group_by(AID, DayNum, DayLabel) %>%
+    summarise(
+      sacclick = mean(sacclick, na.rm = TRUE),
+      waterlick = mean(waterlick, na.rm = TRUE),.groups = "drop"
+    )
+  
+  # report available day usage by ID
+  usage_report <- rm_df %>%
+    mutate(
+      has_sacclick = !is.na(sacclick),
+      has_waterlick = !is.na(waterlick),
+      usable_for_anova = has_sacclick & has_waterlick
+    ) %>%
+    arrange(AID, DayNum)
+  
+  cat("\n===== ID-day availability report =====\n")
+  print(usage_report)
+  
+  # Save report to CSV
+  report_name <- paste0(tools::file_path_sans_ext(file_name), "_ID_day_usage_report.csv")
+  write.csv(usage_report, report_name, row.names = FALSE)
+  cat("\nUsage report saved to:", report_name, "\n")
+  
+  # -------------------------
+  # Keep only days with enough subjects
+  # -------------------------
+  day_subject_counts <- usage_report %>%
+    filter(usable_for_anova) %>%
+    group_by(DayNum, DayLabel) %>%
+    summarise(
+      n_subjects = n_distinct(AID),
+      IDs = paste(sort(unique(AID)), collapse = ", "),.groups = "drop"
+    ) %>%
+    arrange(DayNum)
+  
+  cat("\n===== Subjects available per day for ANOVA =====\n")
+  print(day_subject_counts)
+  
+  valid_days <- day_subject_counts %>%
+    filter(n_subjects >= min_subjects_per_day) %>%
+    pull(DayNum)
+  
+  dropped_days <- day_subject_counts %>%
+    filter(n_subjects < min_subjects_per_day)
+  
+  if (nrow(dropped_days) > 0) {
+    cat("\nDays skipped in ANOVA due to insufficient subjects:\n")
+    print(dropped_days)
+  }
+  
+  if (length(valid_days) < 2) {
+    cat("\nNot enough valid days for repeated measures ANOVA after filtering. Skipping ANOVA.\n")
+    return(invisible(list(
+      raw_data = df,
+      summary_data = summary_df,
+      plot_data = plot_df_clean,
+      usage_report = usage_report,
+      day_subject_counts = day_subject_counts,
+      anova_result = NULL,
+      plot = p
+    )))
+  }
+  
+  anova_df <- rm_df %>%
+    filter(DayNum %in% valid_days) %>%
+    filter(!is.na(sacclick), !is.na(waterlick)) %>%
+    pivot_longer(
+      cols = c(sacclick, waterlick),
+      names_to = "LickType",
+      values_to = "Licks"
+    ) %>%
+    mutate(
+      DayNum = factor(DayNum, levels = sort(unique(valid_days))),
+      LickType = factor(LickType, levels = c("sacclick", "waterlick")),
+      AID = factor(AID)
+    )
+  
+  # Subjects that remain in all retained days
+  subject_day_check <- anova_df %>%
+    distinct(AID, DayNum) %>%
+    group_by(AID) %>%
+    summarise(n_days = n_distinct(DayNum),.groups = "drop")
+  
+  complete_subjects <- subject_day_check %>%
+    filter(n_days == length(valid_days)) %>%
+    pull(AID)
+  
+  if (length(complete_subjects) < 2) {
+    cat("\nNot enough complete subjects across retained days for repeated measures ANOVA. Skipping ANOVA.\n")
+    return(invisible(list(
+      raw_data = df,
+      summary_data = summary_df,
+      plot_data = plot_df_clean,
+      usage_report = usage_report,
+      day_subject_counts = day_subject_counts,
+      anova_result = NULL,
+      plot = p
+    )))
+  }
+  
+  anova_df_complete <- anova_df %>%
+    filter(AID %in% complete_subjects)
+  
+  cat("\n===== Complete subjects used in ANOVA =====\n")
+  print(sort(unique(anova_df_complete$AID)))
+  
+  cat("\n===== Days used in ANOVA =====\n")
+  print(sort(unique(anova_df_complete$DayNum)))
+  
+  anova_id_report <- anova_df_complete %>%
+    distinct(AID, DayNum) %>%
+    arrange(AID, DayNum)
+  
+  anova_id_report_name <- paste0(tools::file_path_sans_ext(file_name), "_ANOVA_ids_days_used.csv")
+  write.csv(anova_id_report, anova_id_report_name, row.names = FALSE)
+  cat("\nANOVA ID/day report saved to:", anova_id_report_name, "\n")
+  
+  # -------------------------
+  # 2-way RM ANOVA
+  # -------------------------
+  cat("\n2-way repeated measures ANOVA: Day x LickType\n")
+  cat("Subject ID: AID\n")
+  
+  anova_result <- ezANOVA(
+    data = anova_df_complete,
+    dv = Licks,
+    wid = AID,
+    within =.(DayNum, LickType),
+    type = 3,
+    detailed = TRUE
+  )
+  
+  print(anova_result)
+  
+  # Save ANOVA table
+  anova_table_name <- paste0(tools::file_path_sans_ext(file_name), "_ANOVA_table.csv")
+  write.csv(anova_result$ANOVA, anova_table_name, row.names = FALSE)
+  cat("\nANOVA table saved to:", anova_table_name, "\n")
+  
+  invisible(list(
+    raw_data = df,
+    summary_data = summary_df,
+    plot_data = plot_df_clean,
+    usage_report = usage_report,
+    day_subject_counts = day_subject_counts,
+    anova_data = anova_df_complete,
+    anova_result = anova_result,
+    plot = p
+  ))
+}
+
+# =========================
+# Run all files safely
+# =========================
+results <- vector("list", length(files))
+names(results) <- files
+
+for (i in seq_along(files)) {
+  results[[i]] <- tryCatch(
+    analyze_file(files[i], min_subjects_per_day = 2),
+    error = function(e) {
+      cat("\nERROR while processing", files[i], ":\n")
+      cat(conditionMessage(e), "\n")
+      return(NULL)
+    }
+  )
+}
