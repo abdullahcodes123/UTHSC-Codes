@@ -1,0 +1,578 @@
+# ============================================================
+# RAT LICKS AND INFUSIONS ANALYSIS
+# Repeated-measures ANOVA by sex group
+# Groups: Both, Female, Male
+# ============================================================
+
+
+# ============================================================
+# 0) INSTALL AND LOAD REQUIRED PACKAGES
+# ============================================================
+
+required_packages <- c(
+  "readxl",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "rstatix"
+)
+
+installed_packages <- rownames(installed.packages())
+
+for (pkg in required_packages) {
+  if (!(pkg %in% installed_packages)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rstatix)
+
+
+# ============================================================
+# 1) FILE PATHS
+# ============================================================
+
+input_file <- "/Users/abdullah/Desktop/new_lab/SANSA/wild_adult.xlsx"
+output_dir <- "/Users/abdullah/Desktop/new_lab/SANSA"
+
+
+# ============================================================
+# 2) READ DATA
+# ============================================================
+
+df <- read_excel(input_file)
+
+cat("\nData were successfully read.\n")
+cat("\nColumn names:\n")
+print(names(df))
+
+
+# ============================================================
+# 3) CHECK REQUIRED COLUMNS
+# ============================================================
+
+required_columns <- c(
+  "AID",
+  "Day",
+  "sacclick",
+  "waterlick",
+  "Infusions",
+  "sex"
+)
+
+missing_columns <- setdiff(required_columns, names(df))
+
+if (length(missing_columns) > 0) {
+  stop(
+    paste(
+      "\nMissing columns:",
+      paste(missing_columns, collapse = ", "),
+      "\nPlease check the column names in the Excel file."
+    )
+  )
+}
+
+
+# ============================================================
+# 4) CLEAN DATA
+# ============================================================
+
+df_clean <- df %>%
+  mutate(
+    AID = trimws(as.character(AID)),
+    AID = as.factor(AID),
+
+    Day = as.numeric(Day),
+
+    sex = trimws(as.character(sex)),
+    sex = case_when(
+      sex %in% c("F", "f", "Female", "female", "FEMALE") ~ "Female",
+      sex %in% c("M", "m", "Male", "male", "MALE") ~ "Male",
+      TRUE ~ sex
+    ),
+    sex = factor(sex, levels = c("Female", "Male")),
+
+    sacclick = as.numeric(sacclick),
+    waterlick = as.numeric(waterlick),
+    Infusions = as.numeric(Infusions)
+  ) %>%
+  arrange(sex, Day, AID)
+
+cat("\nData were cleaned.\n")
+
+cat("\nSex distribution:\n")
+print(table(df_clean$sex, useNA = "ifany"))
+
+cat("\nAnimal IDs:\n")
+print(unique(df_clean$AID))
+
+cat("\nDays:\n")
+print(sort(unique(df_clean$Day)))
+
+
+# ============================================================
+# 5) HELPER FUNCTIONS
+# ============================================================
+
+get_complete_subjects <- function(data, subject_col, expected_n) {
+  data %>%
+    count({{ subject_col }}) %>%
+    filter(n == expected_n) %>%
+    pull({{ subject_col }})
+}
+
+
+print_if_available <- function(result_object, result_name) {
+  cat("\n", result_name, ":\n", sep = "")
+
+  if (is.null(result_object)) {
+    cat("Not available.\n")
+  } else {
+    print(result_object)
+  }
+}
+
+
+# ============================================================
+# 6) ANALYSIS FUNCTION
+# ============================================================
+
+run_sex_analysis <- function(data, sex_group_name) {
+
+  cat("\n\n############################################################\n")
+  cat("ANALYSIS GROUP:", sex_group_name, "\n")
+  cat("############################################################\n")
+
+  # ------------------------------------------------------------
+  # 6.1) Select sex group
+  # ------------------------------------------------------------
+
+  if (sex_group_name == "Both") {
+    df_sub <- data
+  } else {
+    df_sub <- data %>%
+      filter(sex == sex_group_name)
+  }
+
+  df_sub <- df_sub %>%
+    arrange(Day, AID)
+
+  n_animals <- n_distinct(df_sub$AID)
+
+  cat("\nNumber of rows:\n")
+  print(nrow(df_sub))
+
+  cat("\nNumber of animals:\n")
+  print(n_animals)
+
+  cat("\nAnimals:\n")
+  print(unique(df_sub$AID))
+
+  if (n_animals < 2) {
+    cat("\nFewer than 2 animals. Analysis was not performed.\n")
+    return(NULL)
+  }
+
+  # ------------------------------------------------------------
+  # 6.2) Basic data checks
+  # ------------------------------------------------------------
+
+  cat("\nNumber of days available for each animal:\n")
+
+  animal_day_check <- df_sub %>%
+    group_by(AID) %>%
+    summarise(
+      n_days = n_distinct(Day),
+      days_present = paste(sort(unique(Day)), collapse = ", "),
+      .groups = "drop"
+    )
+
+  print(animal_day_check)
+
+  duplicate_check <- df_sub %>%
+    count(AID, Day) %>%
+    filter(n > 1)
+
+  if (nrow(duplicate_check) > 0) {
+    cat("\nWARNING: Duplicate AID-Day combinations were found:\n")
+    print(duplicate_check)
+  } else {
+    cat("\nNo duplicate AID-Day combinations were found.\n")
+  }
+
+  missing_check <- df_sub %>%
+    filter(
+      is.na(AID) |
+        is.na(Day) |
+        is.na(sacclick) |
+        is.na(waterlick) |
+        is.na(Infusions)
+    )
+
+  if (nrow(missing_check) > 0) {
+    cat("\nWARNING: Rows with missing values were found:\n")
+    print(missing_check)
+  } else {
+    cat("\nNo missing values were found in the main analysis columns.\n")
+  }
+
+  # ------------------------------------------------------------
+  # 6.3) Licks data: long format
+  # ------------------------------------------------------------
+
+  licks_long <- df_sub %>%
+    select(AID, Day, sex, sacclick, waterlick) %>%
+    pivot_longer(
+      cols = c(sacclick, waterlick),
+      names_to = "LeverType",
+      values_to = "Licks"
+    ) %>%
+    mutate(
+      LeverType = recode(
+        LeverType,
+        sacclick = "Saccharin licks",
+        waterlick = "Water licks"
+      ),
+      LeverType = factor(
+        LeverType,
+        levels = c("Saccharin licks", "Water licks")
+      ),
+      Day = factor(Day, levels = sort(unique(Day)))
+    ) %>%
+    filter(
+      !is.na(AID),
+      !is.na(Day),
+      !is.na(LeverType),
+      !is.na(Licks)
+    ) %>%
+    arrange(AID, Day, LeverType)
+
+  expected_lick_rows <- length(unique(licks_long$Day)) *
+    length(unique(licks_long$LeverType))
+
+  complete_lick_ids <- get_complete_subjects(
+    data = licks_long,
+    subject_col = AID,
+    expected_n = expected_lick_rows
+  )
+
+  licks_complete <- licks_long %>%
+    filter(AID %in% complete_lick_ids)
+
+  excluded_lick_ids <- setdiff(
+    unique(licks_long$AID),
+    unique(licks_complete$AID)
+  )
+
+  cat("\nExpected lick rows per animal:\n")
+  print(expected_lick_rows)
+
+  cat("\nAnimals included in licks ANOVA:\n")
+  print(unique(licks_complete$AID))
+
+  cat("\nAnimals excluded from licks ANOVA:\n")
+  print(excluded_lick_ids)
+
+  # ------------------------------------------------------------
+  # 6.4) Licks ANOVA
+  # ------------------------------------------------------------
+
+  if (n_distinct(licks_complete$AID) >= 2) {
+
+    licks_anova <- licks_complete %>%
+      anova_test(
+        dv = Licks,
+        wid = AID,
+        within = c(Day, LeverType)
+      )
+
+    licks_anova_table <- get_anova_table(licks_anova)
+
+    cat("\n============================================================\n")
+    cat(sex_group_name, "- LICKS TWO-WAY REPEATED-MEASURES ANOVA\n")
+    cat("============================================================\n")
+    print(licks_anova_table)
+
+  } else {
+
+    licks_anova <- NULL
+    licks_anova_table <- NULL
+
+    cat("\nNot enough complete lick data. Licks ANOVA was not performed.\n")
+  }
+
+  # ------------------------------------------------------------
+  # 6.5) Infusions data
+  # ------------------------------------------------------------
+
+  infusions_long <- df_sub %>%
+    select(AID, Day, sex, Infusions) %>%
+    mutate(
+      Day = factor(Day, levels = sort(unique(Day)))
+    ) %>%
+    filter(
+      !is.na(AID),
+      !is.na(Day),
+      !is.na(Infusions)
+    ) %>%
+    arrange(AID, Day)
+
+  expected_infusion_rows <- length(unique(infusions_long$Day))
+
+  complete_infusion_ids <- get_complete_subjects(
+    data = infusions_long,
+    subject_col = AID,
+    expected_n = expected_infusion_rows
+  )
+
+  infusions_complete <- infusions_long %>%
+    filter(AID %in% complete_infusion_ids)
+
+  excluded_infusion_ids <- setdiff(
+    unique(infusions_long$AID),
+    unique(infusions_complete$AID)
+  )
+
+  cat("\n============================================================\n")
+  cat(sex_group_name, "- ANIMAL CHECK FOR INFUSIONS ANALYSIS\n")
+  cat("============================================================\n")
+
+  cat("\nAnimals included in infusions ANOVA:\n")
+  print(unique(infusions_complete$AID))
+
+  cat("\nAnimals excluded from infusions ANOVA:\n")
+  print(excluded_infusion_ids)
+
+  # ------------------------------------------------------------
+  # 6.6) Infusions ANOVA
+  # ------------------------------------------------------------
+
+  if (n_distinct(infusions_complete$AID) >= 2) {
+
+    infusion_anova <- infusions_complete %>%
+      anova_test(
+        dv = Infusions,
+        wid = AID,
+        within = Day
+      )
+
+    infusion_anova_table <- get_anova_table(infusion_anova)
+
+    cat("\n============================================================\n")
+    cat(sex_group_name, "- INFUSIONS ONE-WAY REPEATED-MEASURES ANOVA\n")
+    cat("============================================================\n")
+    print(infusion_anova_table)
+
+  } else {
+
+    infusion_anova <- NULL
+    infusion_anova_table <- NULL
+
+    cat("\nNot enough complete infusion data. Infusions ANOVA was not performed.\n")
+  }
+
+  # ------------------------------------------------------------
+  # 6.7) Summary data for plotting
+  # ------------------------------------------------------------
+
+  plot_long <- df_sub %>%
+    select(AID, Day, sex, sacclick, waterlick, Infusions) %>%
+    pivot_longer(
+      cols = c(sacclick, waterlick, Infusions),
+      names_to = "Measure",
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Measure = recode(
+        Measure,
+        sacclick = "Saccharin licks",
+        waterlick = "Water licks",
+        Infusions = "Infusions"
+      ),
+      Measure = factor(
+        Measure,
+        levels = c("Saccharin licks", "Water licks", "Infusions")
+      )
+    ) %>%
+    filter(!is.na(Value)) %>%
+    arrange(Day, Measure, AID)
+
+  summary_df <- plot_long %>%
+    group_by(Day, Measure) %>%
+    summarise(
+      Mean = mean(Value, na.rm = TRUE),
+      N = sum(!is.na(Value)),
+      .groups = "drop"
+    ) %>%
+    arrange(Day, Measure)
+
+  cat("\n============================================================\n")
+  cat(sex_group_name, "- SUMMARY DATA FOR PLOTTING\n")
+  cat("============================================================\n")
+  print(summary_df, n = Inf)
+
+  plot_df <- summary_df %>%
+    filter(
+      !is.na(Mean),
+      Mean > 0
+    )
+
+  excluded_plot_rows <- anti_join(
+    summary_df,
+    plot_df,
+    by = c("Day", "Measure", "Mean", "N")
+  )
+
+  if (nrow(excluded_plot_rows) > 0) {
+    cat("\nRows excluded from plotting because Mean is missing or Mean <= 0:\n")
+    print(excluded_plot_rows)
+  } else {
+    cat("\nNo rows were excluded from plotting.\n")
+  }
+
+  # ------------------------------------------------------------
+  # 6.8) Plot
+  # ------------------------------------------------------------
+
+  p <- ggplot(
+    plot_df,
+    aes(x = Day, y = Mean, group = Measure)
+  ) +
+    geom_line(
+      aes(color = Measure, linetype = Measure),
+      linewidth = 1
+    ) +
+    geom_point(
+      aes(shape = Measure, fill = Measure, color = Measure),
+      size = 5,
+      stroke = 1.2
+    ) +
+    scale_x_continuous(
+      breaks = sort(unique(summary_df$Day)),
+      labels = paste("Day", sort(unique(summary_df$Day))),
+      expand = expansion(mult = c(0.02, 0.12))
+    ) +
+    scale_y_log10() +
+    scale_shape_manual(values = c(
+      "Saccharin licks" = 16,
+      "Water licks" = 21,
+      "Infusions" = 15
+    )) +
+    scale_fill_manual(values = c(
+      "Saccharin licks" = "#9c1f5b",
+      "Water licks" = "white",
+      "Infusions" = "#9c1f5b"
+    )) +
+    scale_color_manual(values = c(
+      "Saccharin licks" = "#9c1f5b",
+      "Water licks" = "black",
+      "Infusions" = "#9c1f5b"
+    )) +
+    scale_linetype_manual(values = c(
+      "Saccharin licks" = "dashed",
+      "Water licks" = "dashed",
+      "Infusions" = "dashed"
+    )) +
+    labs(
+      title = paste(sex_group_name, "rats"),
+      x = NULL,
+      y = "Number of infusions or licks / 2.5 h",
+      shape = NULL,
+      fill = NULL,
+      color = NULL,
+      linetype = NULL
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.title.y = element_text(face = "bold"),
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = c(1.0, 0.88),
+      legend.justification = c(0, 1),
+      legend.background = element_blank(),
+      legend.key = element_blank(),
+      plot.margin = margin(10, 120, 10, 10)
+    )
+
+  print(p)
+
+  # ------------------------------------------------------------
+  # 6.9) Save plot
+  # ------------------------------------------------------------
+
+  output_file <- file.path(
+    output_dir,
+    paste0(sex_group_name, "_licks_infusions_plot.png")
+  )
+
+  ggsave(
+    filename = output_file,
+    plot = p,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+
+  cat("\nPlot was saved to:\n")
+  print(output_file)
+
+  # ------------------------------------------------------------
+  # 6.10) Return results
+  # ------------------------------------------------------------
+
+  return(
+    list(
+      sex_group = sex_group_name,
+
+      data = df_sub,
+
+      licks_data = licks_complete,
+      licks_anova = licks_anova,
+      licks_anova_table = licks_anova_table,
+
+      infusion_data = infusions_complete,
+      infusion_anova = infusion_anova,
+      infusion_anova_table = infusion_anova_table,
+
+      summary_df = summary_df,
+      plot = p
+    )
+  )
+}
+
+
+# ============================================================
+# 7) RUN ANALYSES
+# ============================================================
+
+results_both <- run_sex_analysis(df_clean, "Both")
+results_female <- run_sex_analysis(df_clean, "Female")
+results_male <- run_sex_analysis(df_clean, "Male")
+
+
+# ============================================================
+# 8) SHORT SUMMARY TABLES
+# ============================================================
+
+cat("\n\n############################################################\n")
+cat("SHORT SUMMARY: LICKS TWO-WAY REPEATED-MEASURES ANOVA\n")
+cat("############################################################\n")
+
+print_if_available(results_both$licks_anova_table, "BOTH")
+print_if_available(results_female$licks_anova_table, "FEMALE")
+print_if_available(results_male$licks_anova_table, "MALE")
+
+
+cat("\n\n############################################################\n")
+cat("SHORT SUMMARY: INFUSIONS ONE-WAY REPEATED-MEASURES ANOVA\n")
+cat("############################################################\n")
+
+print_if_available(results_both$infusion_anova_table, "BOTH")
+print_if_available(results_female$infusion_anova_table, "FEMALE")
+print_if_available(results_male$infusion_anova_table, "MALE")
