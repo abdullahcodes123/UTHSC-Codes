@@ -2,8 +2,8 @@
 # RAT LICKS AND INFUSIONS ANALYSIS
 # Repeated-measures ANOVA by sex group
 # Groups: Both, Female, Male
+# Within-subject lick factor: SpoutType
 # ============================================================
-
 
 # ============================================================
 # 0) INSTALL AND LOAD REQUIRED PACKAGES
@@ -31,14 +31,12 @@ library(tidyr)
 library(ggplot2)
 library(rstatix)
 
-
 # ============================================================
 # 1) FILE PATHS
 # ============================================================
 
 input_file <- "/Users/abdullah/Desktop/new_lab/SANSA/wild_adult.xlsx"
 output_dir <- "/Users/abdullah/Desktop/new_lab/SANSA"
-
 
 # ============================================================
 # 2) READ DATA
@@ -49,7 +47,6 @@ df <- read_excel(input_file)
 cat("\nData were successfully read.\n")
 cat("\nColumn names:\n")
 print(names(df))
-
 
 # ============================================================
 # 3) CHECK REQUIRED COLUMNS
@@ -75,7 +72,6 @@ if (length(missing_columns) > 0) {
     )
   )
 }
-
 
 # ============================================================
 # 4) CLEAN DATA
@@ -113,7 +109,6 @@ print(unique(df_clean$AID))
 cat("\nDays:\n")
 print(sort(unique(df_clean$Day)))
 
-
 # ============================================================
 # 5) HELPER FUNCTIONS
 # ============================================================
@@ -125,7 +120,6 @@ get_complete_subjects <- function(data, subject_col, expected_n) {
     pull({{ subject_col }})
 }
 
-
 print_if_available <- function(result_object, result_name) {
   cat("\n", result_name, ":\n", sep = "")
 
@@ -135,7 +129,6 @@ print_if_available <- function(result_object, result_name) {
     print(result_object)
   }
 }
-
 
 # ============================================================
 # 6) ANALYSIS FUNCTION
@@ -228,31 +221,31 @@ run_sex_analysis <- function(data, sex_group_name) {
     select(AID, Day, sex, sacclick, waterlick) %>%
     pivot_longer(
       cols = c(sacclick, waterlick),
-      names_to = "LeverType",
+      names_to = "SpoutType",
       values_to = "Licks"
     ) %>%
     mutate(
-      LeverType = recode(
-        LeverType,
-        sacclick = "Saccharin licks",
-        waterlick = "Water licks"
+      SpoutType = recode(
+        SpoutType,
+        sacclick = "Saccharin spout",
+        waterlick = "Water spout"
       ),
-      LeverType = factor(
-        LeverType,
-        levels = c("Saccharin licks", "Water licks")
+      SpoutType = factor(
+        SpoutType,
+        levels = c("Saccharin spout", "Water spout")
       ),
       Day = factor(Day, levels = sort(unique(Day)))
     ) %>%
     filter(
       !is.na(AID),
       !is.na(Day),
-      !is.na(LeverType),
+      !is.na(SpoutType),
       !is.na(Licks)
     ) %>%
-    arrange(AID, Day, LeverType)
+    arrange(AID, Day, SpoutType)
 
   expected_lick_rows <- length(unique(licks_long$Day)) *
-    length(unique(licks_long$LeverType))
+    length(unique(licks_long$SpoutType))
 
   complete_lick_ids <- get_complete_subjects(
     data = licks_long,
@@ -287,13 +280,14 @@ run_sex_analysis <- function(data, sex_group_name) {
       anova_test(
         dv = Licks,
         wid = AID,
-        within = c(Day, LeverType)
+        within = c(Day, SpoutType)
       )
 
     licks_anova_table <- get_anova_table(licks_anova)
 
     cat("\n============================================================\n")
     cat(sex_group_name, "- LICKS TWO-WAY REPEATED-MEASURES ANOVA\n")
+    cat("Within-subject factors: Day and SpoutType\n")
     cat("============================================================\n")
     print(licks_anova_table)
 
@@ -389,13 +383,13 @@ run_sex_analysis <- function(data, sex_group_name) {
     mutate(
       Measure = recode(
         Measure,
-        sacclick = "Saccharin licks",
-        waterlick = "Water licks",
+        sacclick = "Saccharin spout licks",
+        waterlick = "Water spout licks",
         Infusions = "Infusions"
       ),
       Measure = factor(
         Measure,
-        levels = c("Saccharin licks", "Water licks", "Infusions")
+        levels = c("Saccharin spout licks", "Water spout licks", "Infusions")
       )
     ) %>%
     filter(!is.na(Value)) %>%
@@ -440,7 +434,7 @@ run_sex_analysis <- function(data, sex_group_name) {
 
   p <- ggplot(
     plot_df,
-    aes(x = Day, y = Mean, group = Measure)
+    aes(x = as.numeric(as.character(Day)), y = Mean, group = Measure)
   ) +
     geom_line(
       aes(color = Measure, linetype = Measure),
@@ -452,29 +446,29 @@ run_sex_analysis <- function(data, sex_group_name) {
       stroke = 1.2
     ) +
     scale_x_continuous(
-      breaks = sort(unique(summary_df$Day)),
-      labels = paste("Day", sort(unique(summary_df$Day))),
+      breaks = sort(unique(as.numeric(as.character(summary_df$Day)))),
+      labels = paste("Day", sort(unique(as.numeric(as.character(summary_df$Day))))),
       expand = expansion(mult = c(0.02, 0.12))
     ) +
     scale_y_log10() +
     scale_shape_manual(values = c(
-      "Saccharin licks" = 16,
-      "Water licks" = 21,
+      "Saccharin spout licks" = 16,
+      "Water spout licks" = 21,
       "Infusions" = 15
     )) +
     scale_fill_manual(values = c(
-      "Saccharin licks" = "#9c1f5b",
-      "Water licks" = "white",
+      "Saccharin spout licks" = "#9c1f5b",
+      "Water spout licks" = "white",
       "Infusions" = "#9c1f5b"
     )) +
     scale_color_manual(values = c(
-      "Saccharin licks" = "#9c1f5b",
-      "Water licks" = "black",
+      "Saccharin spout licks" = "#9c1f5b",
+      "Water spout licks" = "black",
       "Infusions" = "#9c1f5b"
     )) +
     scale_linetype_manual(values = c(
-      "Saccharin licks" = "dashed",
-      "Water licks" = "dashed",
+      "Saccharin spout licks" = "dashed",
+      "Water spout licks" = "dashed",
       "Infusions" = "dashed"
     )) +
     labs(
@@ -508,7 +502,7 @@ run_sex_analysis <- function(data, sex_group_name) {
 
   output_file <- file.path(
     output_dir,
-    paste0(sex_group_name, "_licks_infusions_plot.png")
+    paste0(sex_group_name, "_spout_licks_infusions_plot.png")
   )
 
   ggsave(
@@ -546,7 +540,6 @@ run_sex_analysis <- function(data, sex_group_name) {
   )
 }
 
-
 # ============================================================
 # 7) RUN ANALYSES
 # ============================================================
@@ -555,19 +548,18 @@ results_both <- run_sex_analysis(df_clean, "Both")
 results_female <- run_sex_analysis(df_clean, "Female")
 results_male <- run_sex_analysis(df_clean, "Male")
 
-
 # ============================================================
 # 8) SHORT SUMMARY TABLES
 # ============================================================
 
 cat("\n\n############################################################\n")
 cat("SHORT SUMMARY: LICKS TWO-WAY REPEATED-MEASURES ANOVA\n")
+cat("Within-subject factors: Day and SpoutType\n")
 cat("############################################################\n")
 
 print_if_available(results_both$licks_anova_table, "BOTH")
 print_if_available(results_female$licks_anova_table, "FEMALE")
 print_if_available(results_male$licks_anova_table, "MALE")
-
 
 cat("\n\n############################################################\n")
 cat("SHORT SUMMARY: INFUSIONS ONE-WAY REPEATED-MEASURES ANOVA\n")
