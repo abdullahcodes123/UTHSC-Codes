@@ -1,0 +1,795 @@
+# ============================================================
+# RAT LICKS AND INFUSIONS ANALYSIS
+# Repeated-measures ANOVA by sex group
+# Groups: Both, Female, Male
+# Within-subject lick factor: SpoutType
+# Plot shows Mean ± SEM
+# Significant SpoutType effect is shown as one star between
+# saccharin and water lick curves.
+# Significant Infusion Day effect is shown as one star near
+# the infusion curve.
+# ============================================================
+
+# ============================================================
+# 0) CLEAR ENVIRONMENT
+# ============================================================
+
+rm(list = ls())
+
+# ============================================================
+# 1) INSTALL AND LOAD REQUIRED PACKAGES
+# ============================================================
+
+required_packages <- c(
+    "readxl",
+    "dplyr",
+    "tidyr",
+    "ggplot2",
+    "rstatix",
+    "stringr"
+)
+
+installed_packages <- rownames(installed.packages())
+
+for (pkg in required_packages) {
+    if (!(pkg %in% installed_packages)) {
+        install.packages(pkg, dependencies = TRUE)
+    }
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rstatix)
+library(stringr)
+
+# ============================================================
+# 2) FILE PATHS
+# ============================================================
+
+input_file <- "/Users/abdullah/Desktop/new_lab/SANSA/adolescent_wild.xlsx"
+output_dir <- "/Users/abdullah/Desktop/new_lab/SANSA/R_outputs"
+
+if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+}
+
+# ============================================================
+# 3) HELPER FUNCTIONS
+# ============================================================
+
+safe_numeric <- function(x) {
+    x <- as.character(x)
+    x <- trimws(x)
+    x <- gsub(",", ".", x)
+    suppressWarnings(as.numeric(x))
+}
+
+safe_day_number <- function(x) {
+    x <- as.character(x)
+    x <- trimws(x)
+    x <- gsub(",", ".", x)
+
+    out <- suppressWarnings(as.numeric(x))
+
+    missing_out <- is.na(out)
+
+    if (any(missing_out)) {
+        out[missing_out] <- suppressWarnings(
+            as.numeric(gsub("[^0-9.]", "", x[missing_out]))
+        )
+    }
+
+    return(out)
+}
+
+clean_anova_table <- function(x) {
+    if (is.null(x)) {
+        return(NULL)
+    }
+
+    x <- as.data.frame(x)
+    attr(x, "args") <- NULL
+    attr(x, "heading") <- NULL
+    attr(x, "class") <- NULL
+    class(x) <- "data.frame"
+
+    return(x)
+}
+
+get_complete_subjects <- function(data, subject_col, expected_n) {
+    data %>%
+        count({{ subject_col }}) %>%
+        filter(n == expected_n) %>%
+        pull({{ subject_col }})
+}
+
+print_if_available <- function(result_object, result_name) {
+    cat("\n", result_name, ":\n", sep = "")
+
+    if (is.null(result_object)) {
+        cat("Not available.\n")
+    } else {
+        print(result_object)
+    }
+}
+
+empty_star_df <- function() {
+    data.frame(
+        x = numeric(0),
+        y = numeric(0),
+        label = character(0)
+    )
+}
+
+# ============================================================
+# 4) READ DATA
+# ============================================================
+
+df <- read_excel(input_file)
+
+cat("\nData were successfully read.\n")
+cat("\nOriginal column names:\n")
+print(names(df))
+
+# ============================================================
+# 5) STANDARDIZE COLUMN NAMES
+# ============================================================
+
+if ("Sex" %in% names(df) && !("sex" %in% names(df))) {
+    df <- df %>%
+        rename(sex = Sex)
+}
+
+if ("infusions" %in% names(df) && !("Infusions" %in% names(df))) {
+    df <- df %>%
+        rename(Infusions = infusions)
+}
+
+if ("aid" %in% names(df) && !("AID" %in% names(df))) {
+    df <- df %>%
+        rename(AID = aid)
+}
+
+if ("day" %in% names(df) && !("Day" %in% names(df))) {
+    df <- df %>%
+        rename(Day = day)
+}
+
+# ============================================================
+# 6) CHECK REQUIRED COLUMNS
+# ============================================================
+
+required_columns <- c(
+    "AID",
+    "Day",
+    "sacclick",
+    "waterlick",
+    "Infusions",
+    "sex"
+)
+
+missing_columns <- setdiff(required_columns, names(df))
+
+if (length(missing_columns) > 0) {
+    stop(
+        paste(
+            "\nMissing columns:",
+            paste(missing_columns, collapse = ", "),
+            "\nPlease check the column names in the Excel file."
+        )
+    )
+}
+
+# ============================================================
+# 7) CLEAN DATA
+# ============================================================
+
+df_clean <- df %>%
+    mutate(
+        AID = trimws(as.character(AID)),
+        AID = as.factor(AID),
+
+        Day = safe_day_number(Day),
+
+        sex = trimws(as.character(sex)),
+        sex = case_when(
+            sex %in% c("F", "f", "Female", "female", "FEMALE") ~ "Female",
+            sex %in% c("M", "m", "Male", "male", "MALE") ~ "Male",
+            TRUE ~ sex
+        ),
+        sex = factor(sex, levels = c("Female", "Male")),
+
+        sacclick = safe_numeric(sacclick),
+        waterlick = safe_numeric(waterlick),
+        Infusions = safe_numeric(Infusions)
+    ) %>%
+    filter(
+        !is.na(AID),
+        !is.na(Day),
+        !is.na(sex),
+        !is.na(sacclick),
+        !is.na(waterlick),
+        !is.na(Infusions)
+    ) %>%
+    arrange(sex, Day, AID)
+
+cat("\nData were cleaned.\n")
+
+cat("\nSex distribution:\n")
+print(table(df_clean$sex, useNA = "ifany"))
+
+cat("\nAnimal IDs:\n")
+print(unique(df_clean$AID))
+
+cat("\nDays:\n")
+print(sort(unique(df_clean$Day)))
+
+if (length(sort(unique(df_clean$Day))) < 2) {
+    stop("\nDay column could not be parsed correctly. Please check the Day column.")
+}
+
+# ============================================================
+# 8) MAIN ANALYSIS FUNCTION
+# ============================================================
+
+run_sex_analysis <- function(data, sex_group_name) {
+
+    cat("\n\n############################################################\n")
+    cat("ANALYSIS GROUP:", sex_group_name, "\n")
+    cat("############################################################\n")
+
+    if (sex_group_name == "Both") {
+        df_sub <- data
+    } else {
+        df_sub <- data %>%
+            filter(sex == sex_group_name)
+    }
+
+    df_sub <- df_sub %>%
+        arrange(Day, AID)
+
+    n_animals <- n_distinct(df_sub$AID)
+
+    cat("\nNumber of rows:\n")
+    print(nrow(df_sub))
+
+    cat("\nNumber of animals:\n")
+    print(n_animals)
+
+    cat("\nAnimals:\n")
+    print(unique(df_sub$AID))
+
+    if (n_animals < 2) {
+        cat("\nFewer than 2 animals. Analysis was not performed.\n")
+        return(NULL)
+    }
+
+    cat("\nNumber of days available for each animal:\n")
+
+    animal_day_check <- df_sub %>%
+        group_by(AID) %>%
+        summarise(
+            n_days = n_distinct(Day),
+            days_present = paste(sort(unique(Day)), collapse = ", "),
+            .groups = "drop"
+        )
+
+    print(animal_day_check)
+
+    duplicate_check <- df_sub %>%
+        count(AID, Day) %>%
+        filter(n > 1)
+
+    if (nrow(duplicate_check) > 0) {
+        cat("\nWARNING: Duplicate AID-Day combinations were found:\n")
+        print(duplicate_check)
+    } else {
+        cat("\nNo duplicate AID-Day combinations were found.\n")
+    }
+
+    # ------------------------------------------------------------
+    # LICKS DATA
+    # ------------------------------------------------------------
+
+    licks_long <- df_sub %>%
+        select(AID, Day, sex, sacclick, waterlick) %>%
+        pivot_longer(
+            cols = c(sacclick, waterlick),
+            names_to = "SpoutType",
+            values_to = "Licks"
+        ) %>%
+        mutate(
+            SpoutType = recode(
+                SpoutType,
+                sacclick = "Saccharin spout",
+                waterlick = "Water spout"
+            ),
+            SpoutType = factor(
+                SpoutType,
+                levels = c("Saccharin spout", "Water spout")
+            ),
+            Day = factor(Day, levels = sort(unique(Day)))
+        ) %>%
+        filter(
+            !is.na(AID),
+            !is.na(Day),
+            !is.na(SpoutType),
+            !is.na(Licks)
+        ) %>%
+        arrange(AID, Day, SpoutType)
+
+    expected_lick_rows <- length(unique(licks_long$Day)) *
+        length(unique(licks_long$SpoutType))
+
+    complete_lick_ids <- get_complete_subjects(
+        data = licks_long,
+        subject_col = AID,
+        expected_n = expected_lick_rows
+    )
+
+    licks_complete <- licks_long %>%
+        filter(AID %in% complete_lick_ids)
+
+    excluded_lick_ids <- setdiff(
+        unique(licks_long$AID),
+        unique(licks_complete$AID)
+    )
+
+    cat("\nExpected lick rows per animal:\n")
+    print(expected_lick_rows)
+
+    cat("\nAnimals included in licks ANOVA:\n")
+    print(unique(licks_complete$AID))
+
+    cat("\nAnimals excluded from licks ANOVA:\n")
+    print(excluded_lick_ids)
+
+    if (n_distinct(licks_complete$AID) >= 2) {
+
+        licks_anova <- licks_complete %>%
+            anova_test(
+                dv = Licks,
+                wid = AID,
+                within = c(Day, SpoutType)
+            )
+
+        licks_anova_table <- clean_anova_table(
+            get_anova_table(licks_anova)
+        )
+
+        cat("\n============================================================\n")
+        cat(sex_group_name, "- LICKS TWO-WAY REPEATED-MEASURES ANOVA\n")
+        cat("Within-subject factors: Day and SpoutType\n")
+        cat("============================================================\n")
+        print(licks_anova_table)
+
+    } else {
+
+        licks_anova <- NULL
+        licks_anova_table <- NULL
+
+        cat("\nNot enough complete lick data. Licks ANOVA was not performed.\n")
+    }
+
+    # ------------------------------------------------------------
+    # INFUSIONS DATA
+    # ------------------------------------------------------------
+
+    infusions_long <- df_sub %>%
+        select(AID, Day, sex, Infusions) %>%
+        mutate(
+            Day = factor(Day, levels = sort(unique(Day)))
+        ) %>%
+        filter(
+            !is.na(AID),
+            !is.na(Day),
+            !is.na(Infusions)
+        ) %>%
+        arrange(AID, Day)
+
+    expected_infusion_rows <- length(unique(infusions_long$Day))
+
+    complete_infusion_ids <- get_complete_subjects(
+        data = infusions_long,
+        subject_col = AID,
+        expected_n = expected_infusion_rows
+    )
+
+    infusions_complete <- infusions_long %>%
+        filter(AID %in% complete_infusion_ids)
+
+    excluded_infusion_ids <- setdiff(
+        unique(infusions_long$AID),
+        unique(infusions_complete$AID)
+    )
+
+    cat("\n============================================================\n")
+    cat(sex_group_name, "- ANIMAL CHECK FOR INFUSIONS ANALYSIS\n")
+    cat("============================================================\n")
+
+    cat("\nAnimals included in infusions ANOVA:\n")
+    print(unique(infusions_complete$AID))
+
+    cat("\nAnimals excluded from infusions ANOVA:\n")
+    print(excluded_infusion_ids)
+
+    if (n_distinct(infusions_complete$AID) >= 2) {
+
+        infusion_anova <- infusions_complete %>%
+            anova_test(
+                dv = Infusions,
+                wid = AID,
+                within = Day
+            )
+
+        infusion_anova_table <- clean_anova_table(
+            get_anova_table(infusion_anova)
+        )
+
+        cat("\n============================================================\n")
+        cat(sex_group_name, "- INFUSIONS ONE-WAY REPEATED-MEASURES ANOVA\n")
+        cat("============================================================\n")
+        print(infusion_anova_table)
+
+    } else {
+
+        infusion_anova <- NULL
+        infusion_anova_table <- NULL
+
+        cat("\nNot enough complete infusion data. Infusions ANOVA was not performed.\n")
+    }
+
+    # ------------------------------------------------------------
+    # SUMMARY DATA FOR PLOTTING
+    # ------------------------------------------------------------
+
+    plot_long <- df_sub %>%
+        select(AID, Day, sex, sacclick, waterlick, Infusions) %>%
+        pivot_longer(
+            cols = c(sacclick, waterlick, Infusions),
+            names_to = "Measure",
+            values_to = "Value"
+        ) %>%
+        mutate(
+            Measure = recode(
+                Measure,
+                sacclick = "Saccharin spout licks",
+                waterlick = "Water spout licks",
+                Infusions = "Infusions"
+            ),
+            Measure = factor(
+                Measure,
+                levels = c(
+                    "Saccharin spout licks",
+                    "Water spout licks",
+                    "Infusions"
+                )
+            )
+        ) %>%
+        filter(!is.na(Value)) %>%
+        arrange(Day, Measure, AID)
+
+    summary_df <- plot_long %>%
+        group_by(Day, Measure) %>%
+        summarise(
+            Mean = mean(Value, na.rm = TRUE),
+            N = sum(!is.na(Value)),
+            SEM = ifelse(
+                N > 1,
+                sd(Value, na.rm = TRUE) / sqrt(N),
+                NA_real_
+            ),
+            .groups = "drop"
+        ) %>%
+        arrange(Day, Measure)
+
+    cat("\n============================================================\n")
+    cat(sex_group_name, "- SUMMARY DATA FOR PLOTTING\n")
+    cat("============================================================\n")
+    print(summary_df, n = Inf)
+
+    plot_df <- summary_df %>%
+        filter(
+            !is.na(Mean),
+            Mean > 0
+        )
+
+    excluded_plot_rows <- anti_join(
+        summary_df,
+        plot_df,
+        by = c("Day", "Measure", "Mean", "N", "SEM")
+    )
+
+    if (nrow(excluded_plot_rows) > 0) {
+        cat("\nRows excluded from plotting because Mean is missing or Mean <= 0:\n")
+        print(excluded_plot_rows)
+    } else {
+        cat("\nNo rows were excluded from plotting.\n")
+    }
+
+    plot_df_error <- plot_df %>%
+        filter(
+            !is.na(SEM),
+            Mean - SEM > 0
+        )
+
+    # ------------------------------------------------------------
+    # SIGNIFICANCE STAR FOR SPOUTTYPE
+    # ------------------------------------------------------------
+
+    spouttype_is_significant <- FALSE
+
+    if (!is.null(licks_anova_table)) {
+        spouttype_result <- licks_anova_table[
+            licks_anova_table$Effect == "SpoutType",
+        ]
+
+        if (nrow(spouttype_result) > 0) {
+            spouttype_is_significant <- !is.na(spouttype_result$p[1]) &&
+                spouttype_result$p[1] < 0.05
+        }
+    }
+
+    star_df_spout <- empty_star_df()
+
+    if (spouttype_is_significant) {
+
+        last_day <- max(plot_df$Day, na.rm = TRUE)
+
+        last_day_licks <- plot_df %>%
+            filter(
+                Day == last_day,
+                Measure %in% c(
+                    "Saccharin spout licks",
+                    "Water spout licks"
+                )
+            )
+
+        if (nrow(last_day_licks) == 2) {
+
+            star_y <- exp(mean(log(last_day_licks$Mean), na.rm = TRUE))
+
+            star_df_spout <- data.frame(
+                x = last_day + 0.25,
+                y = star_y,
+                label = "*"
+            )
+        }
+    }
+
+    # ------------------------------------------------------------
+    # SIGNIFICANCE STAR FOR INFUSIONS DAY EFFECT
+    # ------------------------------------------------------------
+
+    infusion_day_is_significant <- FALSE
+
+    if (!is.null(infusion_anova_table)) {
+        infusion_day_result <- infusion_anova_table[
+            infusion_anova_table$Effect == "Day",
+        ]
+
+        if (nrow(infusion_day_result) > 0) {
+            infusion_day_is_significant <- !is.na(infusion_day_result$p[1]) &&
+                infusion_day_result$p[1] < 0.05
+        }
+    }
+
+    star_df_infusion <- empty_star_df()
+
+    if (infusion_day_is_significant) {
+
+        infusion_rows <- plot_df %>%
+            filter(Measure == "Infusions")
+
+        if (nrow(infusion_rows) > 0) {
+
+            last_day <- max(infusion_rows$Day, na.rm = TRUE)
+            last_infusion_mean <- infusion_rows %>%
+                filter(Day == last_day) %>%
+                pull(Mean)
+
+            star_df_infusion <- data.frame(
+                x = last_day + 0.25,
+                y = last_infusion_mean[1],
+                label = "*"
+            )
+        }
+    }
+
+    # ------------------------------------------------------------
+    # PLOT
+    # ------------------------------------------------------------
+
+    day_breaks <- sort(unique(plot_df$Day))
+    day_labels <- paste("Day", day_breaks)
+
+    p <- ggplot(
+        plot_df,
+        aes(x = Day, y = Mean, group = Measure)
+    ) +
+        geom_line(
+            aes(color = Measure, linetype = Measure),
+            linewidth = 1
+        ) +
+        geom_errorbar(
+            data = plot_df_error,
+            aes(
+                ymin = Mean - SEM,
+                ymax = Mean + SEM,
+                color = Measure
+            ),
+            width = 0.15,
+            linewidth = 0.6
+        ) +
+        geom_point(
+            aes(shape = Measure, fill = Measure, color = Measure),
+            size = 5,
+            stroke = 1.2
+        ) +
+        geom_text(
+            data = star_df_spout,
+            aes(x = x, y = y, label = label),
+            inherit.aes = FALSE,
+            size = 9,
+            fontface = "bold"
+        ) +
+        geom_text(
+            data = star_df_infusion,
+            aes(x = x, y = y, label = label),
+            inherit.aes = FALSE,
+            size = 9,
+            fontface = "bold"
+        ) +
+        scale_x_continuous(
+            breaks = day_breaks,
+            labels = day_labels,
+            expand = expansion(mult = c(0.02, 0.18))
+        ) +
+        scale_y_log10() +
+        scale_shape_manual(values = c(
+            "Saccharin spout licks" = 16,
+            "Water spout licks" = 21,
+            "Infusions" = 15
+        )) +
+        scale_fill_manual(values = c(
+            "Saccharin spout licks" = "#9c1f5b",
+            "Water spout licks" = "white",
+            "Infusions" = "#9c1f5b"
+        )) +
+        scale_color_manual(values = c(
+            "Saccharin spout licks" = "#9c1f5b",
+            "Water spout licks" = "black",
+            "Infusions" = "#9c1f5b"
+        )) +
+        scale_linetype_manual(values = c(
+            "Saccharin spout licks" = "dashed",
+            "Water spout licks" = "dashed",
+            "Infusions" = "dashed"
+        )) +
+        labs(
+            title = paste(sex_group_name, "rats"),
+            x = NULL,
+            y = "Number of infusions or licks / 2.5 h",
+            shape = NULL,
+            fill = NULL,
+            color = NULL,
+            linetype = NULL
+        ) +
+        coord_cartesian(clip = "off") +
+        theme_classic(base_size = 12) +
+        theme(
+            plot.title = element_text(face = "bold", hjust = 0.5),
+            axis.title.y = element_text(face = "bold"),
+            axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = c(1.0, 0.88),
+            legend.justification = c(0, 1),
+            legend.background = element_blank(),
+            legend.key = element_blank(),
+            plot.margin = margin(10, 120, 10, 10)
+        )
+
+    print(p)
+
+    # ------------------------------------------------------------
+    # SAVE OUTPUTS
+    # ------------------------------------------------------------
+
+    base_name <- paste0(sex_group_name, "_spout_licks_infusions")
+
+    output_plot_file <- file.path(
+        output_dir,
+        paste0(base_name, "_plot.png")
+    )
+
+    output_summary_file <- file.path(
+        output_dir,
+        paste0(base_name, "_summary_data.csv")
+    )
+
+    ggsave(
+        filename = output_plot_file,
+        plot = p,
+        width = 8,
+        height = 5,
+        dpi = 300
+    )
+
+    write.csv(
+        summary_df,
+        file = output_summary_file,
+        row.names = FALSE
+    )
+
+    if (!is.null(licks_anova_table)) {
+        write.csv(
+            licks_anova_table,
+            file = file.path(output_dir, paste0(base_name, "_licks_anova.csv")),
+            row.names = FALSE
+        )
+    }
+
+    if (!is.null(infusion_anova_table)) {
+        write.csv(
+            infusion_anova_table,
+            file = file.path(output_dir, paste0(base_name, "_infusions_anova.csv")),
+            row.names = FALSE
+        )
+    }
+
+    cat("\nPlot was saved to:\n")
+    print(output_plot_file)
+
+    cat("\nSummary data were saved to:\n")
+    print(output_summary_file)
+
+    return(
+        list(
+            sex_group = sex_group_name,
+            data = df_sub,
+            licks_data = licks_complete,
+            licks_anova = licks_anova,
+            licks_anova_table = licks_anova_table,
+            infusion_data = infusions_complete,
+            infusion_anova = infusion_anova,
+            infusion_anova_table = infusion_anova_table,
+            summary_df = summary_df,
+            plot = p
+        )
+    )
+}
+
+# ============================================================
+# 9) RUN ANALYSES
+# ============================================================
+
+results_both <- run_sex_analysis(df_clean, "Both")
+results_female <- run_sex_analysis(df_clean, "Female")
+results_male <- run_sex_analysis(df_clean, "Male")
+
+# ============================================================
+# 10) SHORT SUMMARY TABLES
+# ============================================================
+
+cat("\n\n############################################################\n")
+cat("SHORT SUMMARY: LICKS TWO-WAY REPEATED-MEASURES ANOVA\n")
+cat("Within-subject factors: Day and SpoutType\n")
+cat("############################################################\n")
+
+print_if_available(results_both$licks_anova_table, "BOTH")
+print_if_available(results_female$licks_anova_table, "FEMALE")
+print_if_available(results_male$licks_anova_table, "MALE")
+
+cat("\n\n############################################################\n")
+cat("SHORT SUMMARY: INFUSIONS ONE-WAY REPEATED-MEASURES ANOVA\n")
+cat("############################################################\n")
+
+print_if_available(results_both$infusion_anova_table, "BOTH")
+print_if_available(results_female$infusion_anova_table, "FEMALE")
+print_if_available(results_male$infusion_anova_table, "MALE")
+
+cat("\n\nAnalysis completed successfully.\n")
+cat("All plots and CSV files were saved in:\n")
+cat(output_dir, "\n")
