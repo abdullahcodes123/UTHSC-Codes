@@ -1,0 +1,620 @@
+############################################################
+# SANSA 4-Day Rat-Level Analysis
+# Active Licks, Inactive Licks, Infusions, and Female Combined Plot
+############################################################
+
+# -----------------------------
+# 1. Install and load packages
+# -----------------------------
+
+required_packages <- c(
+  "readxl",
+  "dplyr",
+  "ggplot2",
+  "janitor",
+  "stringr",
+  "tidyr",
+  "lubridate"
+)
+
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+
+if (length(new_packages) > 0) {
+  install.packages(new_packages)
+}
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(janitor)
+library(stringr)
+library(tidyr)
+library(lubridate)
+
+# -----------------------------
+# 2. Define file path and output folder
+# -----------------------------
+
+file_path <- "/Users/abdullah/Desktop/new_lab/SANSA_TEST/4_DAY.xlsx"
+
+output_folder <- "/Users/abdullah/Desktop/new_lab/SANSA_TEST/R_outputs"
+
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+# -----------------------------
+# 3. Read Excel file
+# -----------------------------
+# All columns are read as text to prevent Excel/R date-format problems.
+
+raw_data <- read_excel(
+  path = file_path,
+  col_types = "text"
+)
+
+data <- raw_data %>%
+  clean_names()
+
+# -----------------------------
+# 4. Check required columns
+# -----------------------------
+
+required_columns <- c(
+  "zdate",
+  "start_time",
+  "aid",
+  "sacclick",
+  "waterlick",
+  "infusions",
+  "sex"
+)
+
+missing_columns <- setdiff(required_columns, names(data))
+
+if (length(missing_columns) > 0) {
+  stop(
+    paste(
+      "The following required columns are missing from the Excel file:",
+      paste(missing_columns, collapse = ", ")
+    )
+  )
+}
+
+# -----------------------------
+# 5. Clean and prepare data
+# -----------------------------
+
+clean_data <- data %>%
+  mutate(
+    aid = as.character(aid),
+    sex = str_to_upper(str_trim(as.character(sex))),
+    zdate = str_trim(as.character(zdate)),
+    start_time = str_trim(as.character(start_time)),
+    
+    zdate = mdy(zdate),
+    
+    sacclick = as.numeric(sacclick),
+    waterlick = as.numeric(waterlick),
+    infusions = as.numeric(infusions)
+  ) %>%
+  filter(
+    !is.na(aid),
+    aid != "",
+    !is.na(zdate)
+  ) %>%
+  arrange(aid, zdate, start_time)
+
+# -----------------------------
+# 6. Create rat-specific day order
+# -----------------------------
+# For each AID:
+# All available dates are identified.
+# Dates are sorted chronologically.
+# The first date becomes Day 1.
+# The second date becomes Day 2.
+# The third date becomes Day 3, and so on.
+
+day_lookup <- clean_data %>%
+  distinct(aid, zdate) %>%
+  arrange(aid, zdate) %>%
+  group_by(aid) %>%
+  mutate(
+    rat_day_number = row_number(),
+    rat_day = paste0("Day ", rat_day_number)
+  ) %>%
+  ungroup()
+
+analysis_data <- clean_data %>%
+  left_join(day_lookup, by = c("aid", "zdate")) %>%
+  mutate(
+    rat_day = factor(
+      rat_day,
+      levels = paste0("Day ", sort(unique(rat_day_number)))
+    ),
+    sex = case_when(
+      sex == "F" ~ "Female",
+      sex == "M" ~ "Male",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# -----------------------------
+# 7. Save cleaned analysis data
+# -----------------------------
+
+write.csv(
+  analysis_data,
+  file = file.path(output_folder, "cleaned_rat_day_analysis_data.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 8. Define sex colors
+# -----------------------------
+
+sex_colors <- c(
+  "Female" = "pink",
+  "Male" = "blue",
+  "Unknown" = "gray50"
+)
+
+# -----------------------------
+# 9. Individual rat-level plot function
+# -----------------------------
+
+create_rat_plot <- function(data, y_variable, y_label, plot_title, file_name) {
+  
+  plot <- ggplot(
+    data = data,
+    aes(
+      x = rat_day,
+      y = .data[[y_variable]],
+      group = aid,
+      color = sex
+    )
+  ) +
+    geom_line(alpha = 0.75, linewidth = 0.8) +
+    geom_point(size = 3, alpha = 0.9) +
+    scale_color_manual(values = sex_colors) +
+    labs(
+      title = plot_title,
+      x = "Rat-Specific Training Day",
+      y = y_label,
+      color = "Sex"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+  
+  print(plot)
+  
+  ggsave(
+    filename = file.path(output_folder, file_name),
+    plot = plot,
+    width = 8,
+    height = 6,
+    dpi = 300
+  )
+  
+  return(plot)
+}
+
+# -----------------------------
+# 10. Active lick plot
+# -----------------------------
+
+active_lick_plot <- create_rat_plot(
+  data = analysis_data,
+  y_variable = "sacclick",
+  y_label = "Active Licks",
+  plot_title = "Active Licks Across Rat-Specific Training Days",
+  file_name = "active_licks_by_rat_day.png"
+)
+
+# -----------------------------
+# 11. Inactive lick plot
+# -----------------------------
+
+inactive_lick_plot <- create_rat_plot(
+  data = analysis_data,
+  y_variable = "waterlick",
+  y_label = "Inactive Licks",
+  plot_title = "Inactive Licks Across Rat-Specific Training Days",
+  file_name = "inactive_licks_by_rat_day.png"
+)
+
+# -----------------------------
+# 12. Infusion plot
+# -----------------------------
+
+infusion_plot <- create_rat_plot(
+  data = analysis_data,
+  y_variable = "infusions",
+  y_label = "Infusions",
+  plot_title = "Infusions Across Rat-Specific Training Days",
+  file_name = "infusions_by_rat_day.png"
+)
+
+# -----------------------------
+# 13. Labeled rat-level plot function
+# -----------------------------
+
+create_labeled_rat_plot <- function(data, y_variable, y_label, plot_title, file_name) {
+  
+  plot <- ggplot(
+    data = data,
+    aes(
+      x = rat_day,
+      y = .data[[y_variable]],
+      group = aid,
+      color = sex,
+      label = aid
+    )
+  ) +
+    geom_line(alpha = 0.65, linewidth = 0.8) +
+    geom_point(size = 3, alpha = 0.9) +
+    geom_text(
+      size = 2.8,
+      vjust = -0.7,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = sex_colors) +
+    labs(
+      title = plot_title,
+      x = "Rat-Specific Training Day",
+      y = y_label,
+      color = "Sex"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+  
+  print(plot)
+  
+  ggsave(
+    filename = file.path(output_folder, file_name),
+    plot = plot,
+    width = 10,
+    height = 7,
+    dpi = 300
+  )
+  
+  return(plot)
+}
+
+active_lick_labeled_plot <- create_labeled_rat_plot(
+  data = analysis_data,
+  y_variable = "sacclick",
+  y_label = "Active Licks",
+  plot_title = "Active Licks Across Rat-Specific Training Days with Rat IDs",
+  file_name = "active_licks_by_rat_day_labeled.png"
+)
+
+inactive_lick_labeled_plot <- create_labeled_rat_plot(
+  data = analysis_data,
+  y_variable = "waterlick",
+  y_label = "Inactive Licks",
+  plot_title = "Inactive Licks Across Rat-Specific Training Days with Rat IDs",
+  file_name = "inactive_licks_by_rat_day_labeled.png"
+)
+
+infusion_labeled_plot <- create_labeled_rat_plot(
+  data = analysis_data,
+  y_variable = "infusions",
+  y_label = "Infusions",
+  plot_title = "Infusions Across Rat-Specific Training Days with Rat IDs",
+  file_name = "infusions_by_rat_day_labeled.png"
+)
+
+# -----------------------------
+# 14. Faceted rat-level plot function
+# -----------------------------
+
+create_faceted_rat_plot <- function(data, y_variable, y_label, plot_title, file_name) {
+  
+  plot <- ggplot(
+    data = data,
+    aes(
+      x = rat_day,
+      y = .data[[y_variable]],
+      group = aid,
+      color = sex
+    )
+  ) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2.8) +
+    facet_wrap(~ aid, scales = "free_y") +
+    scale_color_manual(values = sex_colors) +
+    labs(
+      title = plot_title,
+      x = "Rat-Specific Training Day",
+      y = y_label,
+      color = "Sex"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+  
+  print(plot)
+  
+  ggsave(
+    filename = file.path(output_folder, file_name),
+    plot = plot,
+    width = 12,
+    height = 8,
+    dpi = 300
+  )
+  
+  return(plot)
+}
+
+active_lick_faceted_plot <- create_faceted_rat_plot(
+  data = analysis_data,
+  y_variable = "sacclick",
+  y_label = "Active Licks",
+  plot_title = "Active Licks Across Training Days by Rat",
+  file_name = "active_licks_faceted_by_rat.png"
+)
+
+inactive_lick_faceted_plot <- create_faceted_rat_plot(
+  data = analysis_data,
+  y_variable = "waterlick",
+  y_label = "Inactive Licks",
+  plot_title = "Inactive Licks Across Training Days by Rat",
+  file_name = "inactive_licks_faceted_by_rat.png"
+)
+
+infusion_faceted_plot <- create_faceted_rat_plot(
+  data = analysis_data,
+  y_variable = "infusions",
+  y_label = "Infusions",
+  plot_title = "Infusions Across Training Days by Rat",
+  file_name = "infusions_faceted_by_rat.png"
+)
+
+# -----------------------------
+# 15. Summary statistics by day and sex
+# -----------------------------
+
+summary_by_day_sex <- analysis_data %>%
+  group_by(rat_day_number, rat_day, sex) %>%
+  summarise(
+    n_rats = n_distinct(aid),
+    
+    mean_active_licks = mean(sacclick, na.rm = TRUE),
+    se_active_licks = sd(sacclick, na.rm = TRUE) / sqrt(sum(!is.na(sacclick))),
+    
+    mean_inactive_licks = mean(waterlick, na.rm = TRUE),
+    se_inactive_licks = sd(waterlick, na.rm = TRUE) / sqrt(sum(!is.na(waterlick))),
+    
+    mean_infusions = mean(infusions, na.rm = TRUE),
+    se_infusions = sd(infusions, na.rm = TRUE) / sqrt(sum(!is.na(infusions))),
+    
+    .groups = "drop"
+  )
+
+write.csv(
+  summary_by_day_sex,
+  file = file.path(output_folder, "summary_by_day_and_sex.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 16. Mean ± SE plot function by sex
+# -----------------------------
+
+create_summary_plot <- function(summary_data, mean_variable, se_variable, y_label, plot_title, file_name) {
+  
+  plot <- ggplot(
+    data = summary_data,
+    aes(
+      x = rat_day,
+      y = .data[[mean_variable]],
+      group = sex,
+      color = sex
+    )
+  ) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(
+      aes(
+        ymin = .data[[mean_variable]] - .data[[se_variable]],
+        ymax = .data[[mean_variable]] + .data[[se_variable]]
+      ),
+      width = 0.15,
+      linewidth = 0.7
+    ) +
+    scale_color_manual(values = sex_colors) +
+    labs(
+      title = plot_title,
+      x = "Rat-Specific Training Day",
+      y = y_label,
+      color = "Sex"
+    ) +
+    theme_classic(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.position = "right"
+    )
+  
+  print(plot)
+  
+  ggsave(
+    filename = file.path(output_folder, file_name),
+    plot = plot,
+    width = 8,
+    height = 6,
+    dpi = 300
+  )
+  
+  return(plot)
+}
+
+active_lick_summary_plot <- create_summary_plot(
+  summary_data = summary_by_day_sex,
+  mean_variable = "mean_active_licks",
+  se_variable = "se_active_licks",
+  y_label = "Mean Active Licks ± SE",
+  plot_title = "Mean Active Licks Across Training Days by Sex",
+  file_name = "mean_active_licks_by_day_and_sex.png"
+)
+
+inactive_lick_summary_plot <- create_summary_plot(
+  summary_data = summary_by_day_sex,
+  mean_variable = "mean_inactive_licks",
+  se_variable = "se_inactive_licks",
+  y_label = "Mean Inactive Licks ± SE",
+  plot_title = "Mean Inactive Licks Across Training Days by Sex",
+  file_name = "mean_inactive_licks_by_day_and_sex.png"
+)
+
+infusion_summary_plot <- create_summary_plot(
+  summary_data = summary_by_day_sex,
+  mean_variable = "mean_infusions",
+  se_variable = "se_infusions",
+  y_label = "Mean Infusions ± SE",
+  plot_title = "Mean Infusions Across Training Days by Sex",
+  file_name = "mean_infusions_by_day_and_sex.png"
+)
+
+# -----------------------------
+# 17. Female-only combined active and inactive mean ± SE plot
+# -----------------------------
+# This plot combines active and inactive licks for females only.
+# Active licks are shown with a solid line.
+# Inactive licks are shown with a dotted line.
+# Active and inactive have different colors.
+
+female_combined_data <- analysis_data %>%
+  filter(sex == "Female") %>%
+  group_by(rat_day_number, rat_day) %>%
+  summarise(
+    n_female_rats = n_distinct(aid),
+    
+    mean_active_licks = mean(sacclick, na.rm = TRUE),
+    se_active_licks = sd(sacclick, na.rm = TRUE) / sqrt(sum(!is.na(sacclick))),
+    
+    mean_inactive_licks = mean(waterlick, na.rm = TRUE),
+    se_inactive_licks = sd(waterlick, na.rm = TRUE) / sqrt(sum(!is.na(waterlick))),
+    
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(
+      mean_active_licks,
+      se_active_licks,
+      mean_inactive_licks,
+      se_inactive_licks
+    ),
+    names_to = c(".value", "lick_type"),
+    names_pattern = "(mean|se)_(active_licks|inactive_licks)"
+  ) %>%
+  mutate(
+    lick_type = case_when(
+      lick_type == "active_licks" ~ "Active Licks",
+      lick_type == "inactive_licks" ~ "Inactive Licks",
+      TRUE ~ lick_type
+    ),
+    line_type = case_when(
+      lick_type == "Active Licks" ~ "Active Licks",
+      lick_type == "Inactive Licks" ~ "Inactive Licks",
+      TRUE ~ lick_type
+    )
+  )
+
+female_combined_colors <- c(
+  "Active Licks" = "deeppink3",
+  "Inactive Licks" = "darkorange2"
+)
+
+female_combined_linetypes <- c(
+  "Active Licks" = "solid",
+  "Inactive Licks" = "dotted"
+)
+
+female_active_inactive_combined_plot <- ggplot(
+  data = female_combined_data,
+  aes(
+    x = rat_day,
+    y = mean,
+    group = lick_type,
+    color = lick_type,
+    linetype = line_type
+  )
+) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(
+      ymin = mean - se,
+      ymax = mean + se
+    ),
+    width = 0.15,
+    linewidth = 0.7
+  ) +
+  scale_color_manual(values = female_combined_colors) +
+  scale_linetype_manual(values = female_combined_linetypes) +
+  labs(
+    title = "Female Rats: Mean Active and Inactive Licks Across Training Days",
+    x = "Rat-Specific Training Day",
+    y = "Mean Licks ± SE",
+    color = "Lick Type",
+    linetype = "Lick Type"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+print(female_active_inactive_combined_plot)
+
+ggsave(
+  filename = file.path(output_folder, "female_mean_active_inactive_licks_combined.png"),
+  plot = female_active_inactive_combined_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+write.csv(
+  female_combined_data,
+  file = file.path(output_folder, "female_mean_active_inactive_licks_combined_data.csv"),
+  row.names = FALSE
+)
+
+# -----------------------------
+# 18. Print confirmation and preview
+# -----------------------------
+
+cat("\nAnalysis completed successfully.\n")
+cat("Cleaned data, summary tables, and plots were saved in:\n")
+cat(output_folder, "\n\n")
+
+cat("Preview of rat-specific day assignment:\n")
+print(
+  analysis_data %>%
+    select(aid, sex, zdate, rat_day, sacclick, waterlick, infusions) %>%
+    arrange(aid, zdate)
+)
+
+cat("\nPreview of female combined active/inactive summary:\n")
+print(female_combined_data)
