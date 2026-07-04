@@ -1,0 +1,153 @@
+# ============================================================
+# DemoLick by Day — Female ve Male icin ayri plot
+# Individual lines = blue
+# Mean ± SEM = red
+# ============================================================
+
+# Paketler
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(janitor)
+
+# Dosya konumu
+input_file <- "/Users/abdullah/Desktop/new_lab/SANSA/adolescent_wild.xlsx"
+
+# Excel oku ve kolon isimlerini temizle
+df <- read_excel(input_file) %>%
+  clean_names()
+
+# Veri temizleme
+df_clean <- df %>%
+  mutate(
+    day = as.numeric(day),
+    demo_lick = as.numeric(demo_lick),
+    sex = toupper(trimws(sex)),
+    aid = as.factor(aid)
+  ) %>%
+  filter(
+    !is.na(day),
+    !is.na(demo_lick),
+    sex %in% c("F", "M")
+  )
+
+# Ortalama ve SEM hesapla
+summary_df <- df_clean %>%
+  group_by(sex, day) %>%
+  summarise(
+    mean_demo_lick = mean(demo_lick, na.rm = TRUE),
+    sd_demo_lick = sd(demo_lick, na.rm = TRUE),
+    n = n(),
+    sem_demo_lick = sd_demo_lick / sqrt(n),
+    .groups = "drop"
+  )
+
+# Plot fonksiyonu
+make_demo_plot <- function(sex_code, plot_title, output_file) {
+  
+  individual_data <- df_clean %>%
+    filter(sex == sex_code)
+  
+  mean_data <- summary_df %>%
+    filter(sex == sex_code)
+  
+  p <- ggplot() +
+    
+    # Individual animal lines - BLUE
+    geom_line(
+      data = individual_data,
+      aes(x = day, y = demo_lick, group = aid),
+      color = "dodgerblue3",
+      linewidth = 0.7,
+      alpha = 0.55
+    ) +
+    
+    # Individual animal points - BLUE
+    geom_point(
+      data = individual_data,
+      aes(x = day, y = demo_lick, group = aid),
+      color = "dodgerblue3",
+      size = 1.8,
+      alpha = 0.65
+    ) +
+    
+    # SEM error bars - RED
+    geom_errorbar(
+      data = mean_data,
+      aes(
+        x = day,
+        ymin = mean_demo_lick - sem_demo_lick,
+        ymax = mean_demo_lick + sem_demo_lick
+      ),
+      color = "red3",
+      width = 0.25,
+      linewidth = 0.9
+    ) +
+    
+    # Mean line - RED
+    geom_line(
+      data = mean_data,
+      aes(x = day, y = mean_demo_lick),
+      color = "red3",
+      linewidth = 1.5
+    ) +
+    
+    # Mean points - RED
+    geom_point(
+      data = mean_data,
+      aes(x = day, y = mean_demo_lick),
+      color = "red3",
+      size = 3.4
+    ) +
+    
+    labs(
+      title = plot_title,
+      x = "Day",
+      y = "DemoLick"
+    ) +
+    
+    scale_x_continuous(
+      breaks = sort(unique(individual_data$day))
+    ) +
+    
+    theme_classic(base_size = 14) +
+    
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 16
+      ),
+      axis.title = element_text(
+        face = "bold",
+        size = 14
+      ),
+      axis.text = element_text(
+        size = 12
+      )
+    )
+  
+  print(p)
+  
+  ggsave(
+    filename = output_file,
+    plot = p,
+    width = 7,
+    height = 5,
+    dpi = 300
+  )
+}
+
+# Female plot
+make_demo_plot(
+  sex_code = "F",
+  plot_title = "Female DemoLick by Day",
+  output_file = "/Users/abdullah/Desktop/new_lab/SANSA/DemoLick_Female_BlueIndividuals_RedMean.png"
+)
+
+# Male plot
+make_demo_plot(
+  sex_code = "M",
+  plot_title = "Male DemoLick by Day",
+  output_file = "/Users/abdullah/Desktop/new_lab/SANSA/DemoLick_Male_BlueIndividuals_RedMean.png"
+)
