@@ -1,0 +1,2130 @@
+# ============================================================
+# RAT LICKS AND INFUSIONS ANALYSIS — v5 WITH AUDIT, SPI, &
+#   SPI PERIOD (FIRST-3 / LAST-3 DAYS) ANALYSIS
+#
+# NEW in v5:
+# 19. SPI PERIOD ANALYSIS (Section 14.5)
+#     a. Mean SPI per animal for First N and Last N days
+#     b. Period (First vs Last) x Genotype mixed ANOVA
+#     c. Paired t-test: First vs Last within each genotype
+#     d. Unpaired t-test: WT vs Cacna1c on Last-N SPI
+#     e. Grouped bar + jitter plots (publication quality)
+#     f. Cohen's d for all period comparisons
+#     All output → SPI_Period_ CSVs + Excel sheets
+#
+# Previous (v4): DATA AUDIT MODULE (Section 4.5)
+# Previous (v3): SPI trajectory analysis (Sections 14–18)
+# Previous (v2): Bug fixes 1–13
+#
+# Data situation handled:
+#   Female: Wild type only (no Cacna1c yet)
+#   Male:   Wild type + Cacna1c heterozygous
+# ============================================================
+
+rm(list = ls())
+
+# ============================================================
+# 1) PACKAGES
+# ============================================================
+
+required_packages <- c(
+    "readxl", "dplyr", "tidyr", "ggplot2",
+    "rstatix", "stringr", "openxlsx"
+)
+
+installed_packages <- rownames(installed.packages())
+for (pkg in required_packages) {
+    if (!(pkg %in% installed_packages)) {
+        install.packages(pkg, dependencies = TRUE)
+    }
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rstatix)
+library(stringr)
+library(openxlsx)
+
+# ============================================================
+# 2) USER SETTINGS
+# ============================================================
+
+single_input_file <- "/Users/abdullah/Desktop/new_lab/SANSA/adolescent_wild.xlsx"
+
+cacna1c_file  <- "/Users/abdullah/Desktop/new_lab/SANSA/adolescent_cacna1c.xlsx"
+wildtype_file <- "/Users/abdullah/Desktop/new_lab/SANSA/adolescent_wild.xlsx"
+
+output_dir <- "/Users/abdullah/Desktop/new_lab/SANSA/R_outputs_final_spout_genotype"
+
+subject_col        <- "AID"
+day_col            <- "Day"
+sex_col            <- "sex"
+active_spout_col   <- "sacclick"
+inactive_spout_col <- "waterlick"
+infusion_col       <- "Infusions"
+
+run_both_combined_analysis    <- FALSE
+use_log10_y_axis              <- TRUE
+minimum_n_per_group_for_ttest <- 2
+session_duration_label        <- "3 h"
+
+# Fixed-ratio schedule (used in sanity checks)
+fixed_ratio <- 10
+
+# SPI period settings (matching GWAS phenotypes in Fig. 4B)
+first_n_days <- 3
+last_n_days  <- 3
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ============================================================
+# 3) HELPER FUNCTIONS
+# ============================================================
+
+safe_numeric <- function(x) {
+    x <- as.character(x); x <- trimws(x); x <- gsub(",", ".", x)
+    suppressWarnings(as.numeric(x))
+}
+
+safe_day_number <- function(x) {
+    x <- as.character(x); x <- trimws(x); x <- gsub(",", ".", x)
+    out <- suppressWarnings(as.numeric(x))
+    missing_out <- is.na(out)
+    if (any(missing_out)) {
+        out[missing_out] <- suppressWarnings(
+            as.numeric(gsub("[^0-9.]", "", x[missing_out]))
+        )
+    }
+    return(out)
+}
+
+standardize_columns <- function(df) {
+    name_map <- c(
+        "sex" = "sex", "Sex" = "sex", "SEX" = "sex",
+        "infusions" = "Infusions", "INFUSIONS" = "Infusions",
+        "aid" = "AID", "Aid" = "AID",
+        "day" = "Day", "DAY" = "Day"
+    )
+    current_names <- names(df)
+    for (i in seq_along(current_names)) {
+        if (current_names[i] %in% names(name_map)) {
+            target <- name_map[current_names[i]]
+            if (!(target %in% current_names)) {
+                current_names[i] <- target
+            }
+        }
+    }
+    names(df) <- current_names
+    return(df)
+}
+
+clean_anova_table <- function(x) {
+    if (is.null(x)) return(NULL)
+    x <- as.data.frame(x)
+    attr(x, "args")    <- NULL
+    attr(x, "heading") <- NULL
+    class(x) <- "data.frame"
+    return(x)
+}
+
+safe_bind <- function(df_list) {
+    df_list <- df_list[!sapply(df_list, is.null)]
+    if (length(df_list) == 0) return(data.frame())
+    bind_rows(df_list)
+}
+
+p_to_star <- function(p) {
+    dplyr::case_when(
+        is.na(p)  ~ "",
+        p < 0.001 ~ "***",
+        p < 0.01  ~ "**",
+        p < 0.05  ~ "*",
+        TRUE      ~ ""
+    )
+}
+
+get_complete_subjects <- function(data, subject_col_name, expected_n) {
+    data %>%
+        count(.data[[subject_col_name]]) %>%
+        filter(n == expected_n) %>%
+        pull(.data[[subject_col_name]])
+}
+
+safe_file_exists <- function(path) {
+    !is.na(path) && nzchar(path) && file.exists(path)
+}
+
+clean_filename <- function(x) {
+    x <- gsub(" ", "_", x); x <- gsub("/", "_", x)
+    x <- gsub(":", "_", x); x <- gsub("\\+", "plus", x)
+    x <- gsub("[^A-Za-z0-9_\\-]", "", x)
+    return(x)
+}
+
+cohens_d_unpaired <- function(x, y) {
+    nx <- length(x); ny <- length(y)
+    if (nx < 2 || ny < 2) return(NA_real_)
+    pooled_sd <- sqrt(((nx - 1) * sd(x)^2 + (ny - 1) * sd(y)^2) / (nx + ny - 2))
+    if (pooled_sd == 0) return(NA_real_)
+    (mean(x) - mean(y)) / pooled_sd
+}
+
+cohens_d_paired <- function(x, y) {
+    diffs <- x - y; n <- length(diffs)
+    if (n < 2) return(NA_real_)
+    sd_diff <- sd(diffs)
+    if (sd_diff == 0) return(NA_real_)
+    mean(diffs) / sd_diff
+}
+
+# Vectorized star y-position (safe for vectors)
+star_y_position <- function(max_val, use_log = TRUE) {
+    ifelse(
+        use_log & max_val > 0,
+        10^(log10(pmax(max_val, 1e-10)) + 0.15),
+        max_val * 1.15
+    )
+}
+
+# Named-vector recode helpers (avoid deprecated recode/case_match)
+recode_spout <- function(x) {
+    lookup <- c("ActiveSpout" = "Active spout", "InactiveSpout" = "Inactive spout")
+    out <- lookup[x]; names(out) <- NULL; return(out)
+}
+
+recode_measure <- function(x) {
+    lookup <- c(
+        "ActiveSpout"   = "Active spout licks",
+        "InactiveSpout" = "Inactive spout licks",
+        "Infusions"     = "Infusions"
+    )
+    out <- lookup[x]; names(out) <- NULL; return(out)
+}
+
+# ============================================================
+# 4) READ DATA
+# ============================================================
+
+genotype_mode <- safe_file_exists(cacna1c_file) && safe_file_exists(wildtype_file)
+
+if (genotype_mode) {
+    cat("\nGenotype mode detected.\n")
+    df_cacna1c_raw <- read_excel(cacna1c_file)
+    df_wildtype_raw <- read_excel(wildtype_file)
+    
+    df_cacna1c <- df_cacna1c_raw %>%
+        standardize_columns() %>% mutate(Genotype = "Cacna1c heterozygous")
+    df_wildtype <- df_wildtype_raw %>%
+        standardize_columns() %>% mutate(Genotype = "Wild type")
+    df <- bind_rows(df_wildtype, df_cacna1c)
+} else {
+    cat("\nSingle-file mode detected.\n")
+    df_wildtype_raw <- read_excel(single_input_file)
+    df_cacna1c_raw  <- NULL
+    df <- df_wildtype_raw %>%
+        standardize_columns() %>% mutate(Genotype = "Single dataset")
+}
+
+cat("\nColumns found:\n"); print(names(df))
+
+required_columns <- c(subject_col, day_col, active_spout_col,
+                      inactive_spout_col, infusion_col, sex_col, "Genotype")
+missing_columns <- setdiff(required_columns, names(df))
+if (length(missing_columns) > 0) {
+    stop(paste("\nMissing columns:", paste(missing_columns, collapse = ", ")))
+}
+
+# ============================================================
+# 4.5) DATA AUDIT MODULE
+# ============================================================
+
+cat("\n\n")
+cat("############################################################\n")
+cat("  DATA AUDIT & INTEGRITY CHECKS\n")
+cat("############################################################\n\n")
+
+audit_log <- character(0)
+alog <- function(msg) {
+    cat(msg, "\n")
+    audit_log <<- c(audit_log, msg)
+}
+
+# ---- AUDIT 1: Source file fingerprint ----
+alog("==== AUDIT 1: Source File Fingerprints ====")
+
+if (genotype_mode) {
+    alog(paste0("Wild type file : ", wildtype_file))
+    alog(paste0("  Rows: ", nrow(df_wildtype_raw),
+                "  Cols: ", ncol(df_wildtype_raw)))
+    alog(paste0("  Column names: ",
+                paste(names(df_wildtype_raw), collapse = ", ")))
+    wt_aids <- sort(unique(as.character(
+        df_wildtype_raw[[subject_col]]
+    )))
+    alog(paste0("  Unique AIDs (", length(wt_aids), "): ",
+                paste(wt_aids, collapse = ", ")))
+    
+    alog(paste0("Cacna1c file   : ", cacna1c_file))
+    alog(paste0("  Rows: ", nrow(df_cacna1c_raw),
+                "  Cols: ", ncol(df_cacna1c_raw)))
+    alog(paste0("  Column names: ",
+                paste(names(df_cacna1c_raw), collapse = ", ")))
+    het_aids <- sort(unique(as.character(
+        df_cacna1c_raw[[subject_col]]
+    )))
+    alog(paste0("  Unique AIDs (", length(het_aids), "): ",
+                paste(het_aids, collapse = ", ")))
+} else {
+    alog(paste0("Single file: ", single_input_file))
+    alog(paste0("  Rows: ", nrow(df_wildtype_raw),
+                "  Cols: ", ncol(df_wildtype_raw)))
+    wt_aids  <- sort(unique(as.character(
+        df_wildtype_raw[[subject_col]]
+    )))
+    het_aids <- character(0)
+    alog(paste0("  Unique AIDs (", length(wt_aids), "): ",
+                paste(wt_aids, collapse = ", ")))
+}
+
+# ---- AUDIT 2: Cross-file AID collision ----
+alog("")
+alog("==== AUDIT 2: Cross-File AID Collision ====")
+if (genotype_mode) {
+    collision_aids <- intersect(wt_aids, het_aids)
+    if (length(collision_aids) > 0) {
+        alog(paste0("*** WARNING *** AIDs found in BOTH files: ",
+                     paste(collision_aids, collapse = ", ")))
+        alog("  These animals appear in both genotype files!")
+        alog("  Check for mislabeling or duplicate entries.")
+    } else {
+        alog("PASS: No AID collisions between files.")
+    }
+} else {
+    alog("N/A: Single-file mode.")
+}
+
+# ============================================================
+# 5) CLEAN DATA
+# ============================================================
+
+df_clean <- df %>%
+    mutate(
+        AID_clean = trimws(as.character(.data[[subject_col]])),
+        Day_clean = safe_day_number(.data[[day_col]]),
+        sex_clean = trimws(as.character(.data[[sex_col]])),
+        sex_clean = dplyr::case_when(
+            tolower(sex_clean) %in% c("f", "female") ~ "Female",
+            tolower(sex_clean) %in% c("m", "male")   ~ "Male",
+            TRUE ~ sex_clean
+        ),
+        sex_clean = factor(sex_clean, levels = c("Female", "Male")),
+        Genotype = factor(
+            Genotype,
+            levels = c("Wild type", "Cacna1c heterozygous", "Single dataset")
+        ),
+        SubjectID = paste(Genotype, AID_clean, sep = "_"),
+        SubjectID = as.factor(SubjectID),
+        ActiveSpout   = safe_numeric(.data[[active_spout_col]]),
+        InactiveSpout = safe_numeric(.data[[inactive_spout_col]]),
+        Infusions     = safe_numeric(.data[[infusion_col]])
+    ) %>%
+    filter(
+        !is.na(AID_clean), !is.na(Day_clean),
+        !is.na(sex_clean), !is.na(Genotype), !is.na(SubjectID)
+    ) %>%
+    arrange(sex_clean, Genotype, Day_clean, SubjectID)
+
+cat("\nData cleaned.\n")
+cat("\nAnimal count by sex and genotype:\n")
+print(
+    df_clean %>%
+        distinct(SubjectID, sex_clean, Genotype) %>%
+        count(sex_clean, Genotype, name = "N_animals")
+)
+cat("\nDays:\n")
+print(sort(unique(df_clean$Day_clean)))
+
+# ---- AUDIT 3: Genotype roster ----
+alog("")
+alog("==== AUDIT 3: Genotype Roster ====")
+genotype_roster <- df_clean %>%
+    distinct(AID_clean, Genotype, sex_clean) %>%
+    arrange(Genotype, sex_clean, AID_clean)
+
+alog("AID -> Genotype + Sex assignments:")
+for (i in seq_len(nrow(genotype_roster))) {
+    alog(paste0("  ", genotype_roster$AID_clean[i],
+                " -> ", genotype_roster$Genotype[i],
+                " (", genotype_roster$sex_clean[i], ")"))
+}
+
+# Check for AIDs with multiple genotypes
+multi_geno <- df_clean %>%
+    distinct(AID_clean, Genotype) %>%
+    count(AID_clean) %>%
+    filter(n > 1)
+if (nrow(multi_geno) > 0) {
+    alog(paste0("*** WARNING *** AIDs with MULTIPLE genotypes: ",
+                paste(multi_geno$AID_clean, collapse = ", ")))
+} else {
+    alog("PASS: Each AID has exactly one genotype.")
+}
+
+# Check for AIDs with multiple sexes
+multi_sex <- df_clean %>%
+    distinct(AID_clean, sex_clean) %>%
+    count(AID_clean) %>%
+    filter(n > 1)
+if (nrow(multi_sex) > 0) {
+    alog(paste0("*** WARNING *** AIDs with MULTIPLE sexes: ",
+                paste(multi_sex$AID_clean, collapse = ", ")))
+} else {
+    alog("PASS: Each AID has exactly one sex.")
+}
+
+# ---- AUDIT 4: Day chronology ----
+alog("")
+alog("==== AUDIT 4: Day Chronology ====")
+day_issues <- df_clean %>%
+    group_by(AID_clean, Genotype) %>%
+    summarise(
+        n_rows     = n(),
+        n_days     = n_distinct(Day_clean),
+        days       = paste(sort(unique(Day_clean)), collapse = ","),
+        has_dups   = n_rows > n_days,
+        min_day    = min(Day_clean),
+        max_day    = max(Day_clean),
+        .groups    = "drop"
+    ) %>%
+    mutate(
+        expected_days = max_day - min_day + 1,
+        has_gaps      = n_days < expected_days
+    )
+
+dup_animals <- day_issues %>% filter(has_dups)
+gap_animals <- day_issues %>% filter(has_gaps)
+
+if (nrow(dup_animals) > 0) {
+    alog("*** WARNING *** Animals with DUPLICATE days:")
+    for (i in seq_len(nrow(dup_animals))) {
+        alog(paste0("  ", dup_animals$AID_clean[i],
+                     " (", dup_animals$Genotype[i], ")",
+                     ": ", dup_animals$n_rows[i], " rows but ",
+                     dup_animals$n_days[i], " unique days"))
+    }
+} else {
+    alog("PASS: No duplicate days found.")
+}
+
+if (nrow(gap_animals) > 0) {
+    alog("*** NOTE *** Animals with GAPS in day sequence:")
+    for (i in seq_len(nrow(gap_animals))) {
+        alog(paste0("  ", gap_animals$AID_clean[i],
+                     " (", gap_animals$Genotype[i], ")",
+                     ": Days = [", gap_animals$days[i], "]"))
+    }
+} else {
+    alog("PASS: No day gaps found.")
+}
+
+# ---- AUDIT 5: Day-completeness matrix ----
+alog("")
+alog("==== AUDIT 5: Day-Completeness Matrix ====")
+all_days <- sort(unique(df_clean$Day_clean))
+completeness <- df_clean %>%
+    distinct(AID_clean, Genotype, sex_clean, Day_clean) %>%
+    mutate(present = 1) %>%
+    pivot_wider(
+        names_from  = Day_clean,
+        values_from = present,
+        values_fill = 0,
+        names_prefix = "Day_"
+    ) %>%
+    arrange(Genotype, sex_clean, AID_clean)
+alog("(See AUDIT_Day_Completeness tab in Excel)")
+
+# ---- AUDIT 6: Sanity flags ----
+alog("")
+alog("==== AUDIT 6: Sanity Flags ====")
+
+sanity_flags <- df_clean %>%
+    mutate(
+        flag_neg_active   = ActiveSpout < 0,
+        flag_neg_inactive = InactiveSpout < 0,
+        flag_neg_infusion = Infusions < 0,
+        flag_inf_gt_active_div_FR = !is.na(Infusions) & !is.na(ActiveSpout) &
+            ActiveSpout > 0 & Infusions > (ActiveSpout / fixed_ratio) + 1,
+        flag_inf_but_no_active = !is.na(Infusions) & Infusions > 0 &
+            (is.na(ActiveSpout) | ActiveSpout == 0),
+        any_flag = flag_neg_active | flag_neg_inactive | flag_neg_infusion |
+            flag_inf_gt_active_div_FR | flag_inf_but_no_active
+    ) %>%
+    filter(any_flag) %>%
+    select(AID_clean, Genotype, sex_clean, Day_clean,
+           ActiveSpout, InactiveSpout, Infusions,
+           starts_with("flag_"))
+
+if (nrow(sanity_flags) > 0) {
+    alog(paste0("*** WARNING *** ", nrow(sanity_flags),
+                " rows with sanity flag issues:"))
+    for (i in seq_len(min(nrow(sanity_flags), 20))) {
+        row <- sanity_flags[i, ]
+        flags <- names(row)[grepl("^flag_", names(row)) &
+                                as.logical(row[grepl("^flag_", names(row))])]
+        alog(paste0("  ", row$AID_clean, " Day ", row$Day_clean,
+                     " Active=", row$ActiveSpout,
+                     " Inactive=", row$InactiveSpout,
+                     " Inf=", row$Infusions,
+                     " Flags: ", paste(flags, collapse = ", ")))
+    }
+} else {
+    alog("PASS: No sanity flag issues.")
+}
+
+# ---- AUDIT 7: Raw data dump ----
+alog("")
+alog("==== AUDIT 7: Raw Data Dump ====")
+raw_dump <- df_clean %>%
+    select(AID_clean, Genotype, sex_clean, Day_clean,
+           ActiveSpout, InactiveSpout, Infusions) %>%
+    arrange(Genotype, AID_clean, Day_clean)
+alog(paste0("Raw data dump: ", nrow(raw_dump), " rows for ",
+            n_distinct(raw_dump$AID_clean), " animals."))
+alog("(See AUDIT_Raw_Data_Dump tab in Excel)")
+
+# ---- AUDIT 8: SPI spot-check ----
+alog("")
+alog("==== AUDIT 8: SPI Spot-Check ====")
+set.seed(42)
+spot_check_aids <- sample(unique(df_clean$AID_clean),
+                          min(2, n_distinct(df_clean$AID_clean)))
+
+for (aid in spot_check_aids) {
+    alog(paste0("  SPI spot-check for AID = ", aid, ":"))
+    aid_data <- df_clean %>%
+        filter(AID_clean == aid) %>%
+        arrange(Day_clean) %>%
+        mutate(
+            Total   = ActiveSpout + InactiveSpout,
+            SPI_raw = ifelse(Total > 0,
+                             (ActiveSpout - InactiveSpout) / Total, NA)
+        )
+    for (j in seq_len(nrow(aid_data))) {
+        r <- aid_data[j, ]
+        alog(paste0("    Day ", r$Day_clean,
+                     ": Active=", r$ActiveSpout,
+                     " Inactive=", r$InactiveSpout,
+                     " Total=", r$Total,
+                     " SPI=", round(r$SPI_raw, 4)))
+    }
+}
+
+# Write audit report
+audit_file <- file.path(output_dir, "AUDIT_report.txt")
+writeLines(audit_log, audit_file)
+cat("\nAudit report saved to:", audit_file, "\n")
+
+# ============================================================
+# 6) DATA RESHAPING FUNCTIONS
+# ============================================================
+
+make_licks_long <- function(data) {
+    data %>%
+        select(SubjectID, AID_clean, sex_clean, Genotype,
+               Day_clean, ActiveSpout, InactiveSpout) %>%
+        pivot_longer(
+            cols      = c(ActiveSpout, InactiveSpout),
+            names_to  = "SpoutType",
+            values_to = "Licks"
+        ) %>%
+        mutate(
+            SpoutType = recode_spout(SpoutType),
+            SpoutType = factor(SpoutType,
+                               levels = c("Active spout", "Inactive spout")),
+            DayFactor = factor(Day_clean, levels = sort(unique(Day_clean)))
+        ) %>%
+        filter(!is.na(Licks))
+}
+
+make_plot_long <- function(data) {
+    data %>%
+        select(SubjectID, AID_clean, sex_clean, Genotype,
+               Day_clean, ActiveSpout, InactiveSpout, Infusions) %>%
+        pivot_longer(
+            cols      = c(ActiveSpout, InactiveSpout, Infusions),
+            names_to  = "Measure",
+            values_to = "Value"
+        ) %>%
+        mutate(
+            Measure = recode_measure(Measure),
+            Measure = factor(
+                Measure,
+                levels = c("Active spout licks",
+                           "Inactive spout licks", "Infusions")
+            )
+        ) %>%
+        filter(!is.na(Value))
+}
+
+make_summary <- function(plot_long) {
+    plot_long %>%
+        group_by(Genotype, Day_clean, Measure) %>%
+        summarise(
+            Mean = mean(Value, na.rm = TRUE),
+            N    = sum(!is.na(Value)),
+            SEM  = ifelse(N > 1,
+                          sd(Value, na.rm = TRUE) / sqrt(N),
+                          NA_real_),
+            .groups = "drop"
+        ) %>%
+        arrange(Genotype, Measure, Day_clean)
+}
+
+# ============================================================
+# 7) STATISTICAL TESTS
+# ============================================================
+
+# 7A: Within-genotype spout preference by day
+run_within_genotype_spout_tests_by_day <- function(data, sex_group_name) {
+    test_data <- data %>%
+        select(SubjectID, Genotype, Day_clean,
+               ActiveSpout, InactiveSpout) %>%
+        filter(!is.na(ActiveSpout), !is.na(InactiveSpout))
+    if (nrow(test_data) == 0) return(NULL)
+    
+    out <- test_data %>%
+        group_by(Genotype, Day_clean) %>%
+        group_modify(~ {
+            d <- .x; n_sub <- n_distinct(d$SubjectID)
+            if (n_sub < minimum_n_per_group_for_ttest) {
+                return(data.frame(N = n_sub, p = NA_real_,
+                                  d_effect = NA_real_,
+                                  test = "Skipped: N too small"))
+            }
+            result <- tryCatch(
+                t.test(d$ActiveSpout, d$InactiveSpout, paired = TRUE),
+                error = function(e) NULL)
+            if (is.null(result)) {
+                return(data.frame(N = n_sub, p = NA_real_,
+                                  d_effect = NA_real_,
+                                  test = "Skipped: t-test failed"))
+            }
+            data.frame(N = n_sub, p = result$p.value,
+                       d_effect = cohens_d_paired(
+                           d$ActiveSpout, d$InactiveSpout),
+                       test = "Paired t-test: active vs inactive")
+        }) %>%
+        ungroup() %>%
+        mutate(
+            Sex_group  = sex_group_name,
+            Comparison = "Within genotype spout preference by day",
+            p_adj_BH   = p.adjust(p, method = "BH"),
+            p_star     = p_to_star(p),
+            p_adj_star = p_to_star(p_adj_BH),
+            .before    = 1
+        )
+    return(out)
+}
+
+# 7B: Genotype comparison by spout and day
+run_genotype_tests_by_spout_and_day <- function(licks_long, sex_group_name) {
+    if (!genotype_mode) return(NULL)
+    if (n_distinct(licks_long$Genotype) < 2) return(NULL)
+    
+    out <- licks_long %>%
+        group_by(SpoutType, Day_clean) %>%
+        group_modify(~ {
+            d <- .x
+            n_by_g <- d %>% group_by(Genotype) %>%
+                summarise(N = n_distinct(SubjectID), .groups = "drop")
+            
+            if (n_distinct(d$Genotype) < 2 ||
+                any(n_by_g$N < minimum_n_per_group_for_ttest)) {
+                return(data.frame(
+                    N_wildtype = NA_integer_, N_cacna1c = NA_integer_,
+                    p = NA_real_, d_effect = NA_real_,
+                    test = "Skipped"))
+            }
+            wt  <- d$Licks[d$Genotype == "Wild type"]
+            het <- d$Licks[d$Genotype == "Cacna1c heterozygous"]
+            result <- tryCatch(t.test(Licks ~ Genotype, data = d),
+                               error = function(e) NULL)
+            if (is.null(result)) {
+                return(data.frame(
+                    N_wildtype = length(wt), N_cacna1c = length(het),
+                    p = NA_real_, d_effect = NA_real_,
+                    test = "Skipped"))
+            }
+            data.frame(
+                N_wildtype = length(wt), N_cacna1c = length(het),
+                p = result$p.value,
+                d_effect = cohens_d_unpaired(wt, het),
+                test = "Unpaired t-test: WT vs Cacna1c")
+        }) %>%
+        ungroup() %>%
+        mutate(
+            Sex_group  = sex_group_name,
+            Comparison = "Genotype difference by spout and day",
+            p_adj_BH   = p.adjust(p, method = "BH"),
+            p_star     = p_to_star(p),
+            p_adj_star = p_to_star(p_adj_BH),
+            .before    = 1
+        )
+    return(out)
+}
+
+# 7C: Genotype comparison for infusions by day
+run_genotype_infusion_tests_by_day <- function(data, sex_group_name) {
+    if (!genotype_mode) return(NULL)
+    if (n_distinct(data$Genotype) < 2) return(NULL)
+    
+    test_data <- data %>%
+        select(SubjectID, Genotype, Day_clean, Infusions) %>%
+        filter(!is.na(Infusions))
+    if (nrow(test_data) == 0) return(NULL)
+    
+    out <- test_data %>%
+        group_by(Day_clean) %>%
+        group_modify(~ {
+            d <- .x
+            n_by_g <- d %>% group_by(Genotype) %>%
+                summarise(N = n_distinct(SubjectID), .groups = "drop")
+            if (n_distinct(d$Genotype) < 2 ||
+                any(n_by_g$N < minimum_n_per_group_for_ttest)) {
+                return(data.frame(
+                    N_wildtype = NA_integer_, N_cacna1c = NA_integer_,
+                    p = NA_real_, d_effect = NA_real_,
+                    test = "Skipped"))
+            }
+            wt  <- d$Infusions[d$Genotype == "Wild type"]
+            het <- d$Infusions[d$Genotype == "Cacna1c heterozygous"]
+            result <- tryCatch(t.test(Infusions ~ Genotype, data = d),
+                               error = function(e) NULL)
+            if (is.null(result)) {
+                return(data.frame(
+                    N_wildtype = length(wt), N_cacna1c = length(het),
+                    p = NA_real_, d_effect = NA_real_,
+                    test = "Skipped"))
+            }
+            data.frame(
+                N_wildtype = length(wt), N_cacna1c = length(het),
+                p = result$p.value,
+                d_effect = cohens_d_unpaired(wt, het),
+                test = "Unpaired t-test: WT vs Cacna1c infusions")
+        }) %>%
+        ungroup() %>%
+        mutate(
+            Sex_group  = sex_group_name,
+            Comparison = "Genotype difference in infusions by day",
+            p_adj_BH   = p.adjust(p, method = "BH"),
+            p_star     = p_to_star(p),
+            p_adj_star = p_to_star(p_adj_BH),
+            .before    = 1
+        )
+    return(out)
+}
+
+# 7D: Licks ANOVA (per sex group)
+run_licks_anova <- function(licks_long, sex_group_name) {
+    if (nrow(licks_long) == 0) return(NULL)
+    
+    expected_rows <- length(unique(licks_long$Day_clean)) *
+        length(unique(licks_long$SpoutType))
+    complete_ids <- get_complete_subjects(
+        licks_long, "SubjectID", expected_rows)
+    licks_complete <- licks_long %>%
+        filter(SubjectID %in% complete_ids) %>%
+        droplevels()
+    if (n_distinct(licks_complete$SubjectID) < 2) return(NULL)
+    
+    if (genotype_mode && n_distinct(licks_complete$Genotype) == 2) {
+        result <- tryCatch({
+            licks_complete %>%
+                anova_test(dv = Licks, wid = SubjectID,
+                           between = Genotype,
+                           within = c(DayFactor, SpoutType))
+        }, error = function(e) NULL)
+        table <- clean_anova_table(get_anova_table(result))
+        if (!is.null(table)) {
+            table <- table %>%
+                mutate(Sex_group = sex_group_name,
+                       Analysis = "Licks mixed ANOVA: Genotype x Day x SpoutType",
+                       .before = 1)
+        }
+        return(table)
+    } else {
+        result <- tryCatch({
+            licks_complete %>%
+                anova_test(dv = Licks, wid = SubjectID,
+                           within = c(DayFactor, SpoutType))
+        }, error = function(e) NULL)
+        table <- clean_anova_table(get_anova_table(result))
+        if (!is.null(table)) {
+            table <- table %>%
+                mutate(Sex_group = sex_group_name,
+                       Analysis = "Licks RM-ANOVA: Day x SpoutType",
+                       .before = 1)
+        }
+        return(table)
+    }
+}
+
+# 7E: Full ANOVA with Sex as between-subject factor
+run_full_licks_anova <- function(licks_long) {
+    if (nrow(licks_long) == 0) return(NULL)
+    if (n_distinct(licks_long$sex_clean) < 2) {
+        cat("\nFull licks ANOVA skipped: only one sex present.\n")
+        return(NULL)
+    }
+    
+    expected_rows <- length(unique(licks_long$Day_clean)) *
+        length(unique(licks_long$SpoutType))
+    complete_ids <- get_complete_subjects(
+        licks_long, "SubjectID", expected_rows)
+    licks_complete <- licks_long %>%
+        filter(SubjectID %in% complete_ids) %>%
+        droplevels()
+    if (n_distinct(licks_complete$SubjectID) < 4) return(NULL)
+    
+    if (genotype_mode && n_distinct(licks_complete$Genotype) == 2) {
+        result <- tryCatch({
+            licks_complete %>%
+                anova_test(dv = Licks, wid = SubjectID,
+                           between = c(Genotype, sex_clean),
+                           within = c(DayFactor, SpoutType))
+        }, error = function(e) {
+            cat("\nFull ANOVA (Geno x Sex) error:",
+                conditionMessage(e), "\n")
+            cat("Falling back to Sex-only between factor.\n")
+            NULL
+        })
+        table <- clean_anova_table(get_anova_table(result))
+        if (!is.null(table)) {
+            table <- table %>%
+                mutate(Analysis = "FULL: Genotype x Sex x Day x SpoutType",
+                       .before = 1)
+            return(table)
+        }
+    }
+    
+    # Fallback: Sex only
+    result <- tryCatch({
+        licks_complete %>%
+            anova_test(dv = Licks, wid = SubjectID,
+                       between = sex_clean,
+                       within = c(DayFactor, SpoutType))
+    }, error = function(e) NULL)
+    table <- clean_anova_table(get_anova_table(result))
+    if (!is.null(table)) {
+        table <- table %>%
+            mutate(Analysis = "FULL: Sex x Day x SpoutType",
+                   .before = 1)
+    }
+    return(table)
+}
+
+# 7F: Infusion ANOVA (per sex group)
+run_infusion_anova <- function(data, sex_group_name) {
+    infusion_data <- data %>%
+        select(SubjectID, Genotype, Day_clean, Infusions) %>%
+        filter(!is.na(Infusions)) %>%
+        mutate(DayFactor = factor(Day_clean,
+                                  levels = sort(unique(Day_clean))))
+    if (nrow(infusion_data) == 0) return(NULL)
+    
+    expected_rows <- length(unique(infusion_data$Day_clean))
+    complete_ids <- get_complete_subjects(
+        infusion_data, "SubjectID", expected_rows)
+    inf_complete <- infusion_data %>%
+        filter(SubjectID %in% complete_ids) %>%
+        droplevels()
+    if (n_distinct(inf_complete$SubjectID) < 2) return(NULL)
+    
+    if (genotype_mode && n_distinct(inf_complete$Genotype) == 2) {
+        result <- tryCatch({
+            inf_complete %>%
+                anova_test(dv = Infusions, wid = SubjectID,
+                           between = Genotype, within = DayFactor)
+        }, error = function(e) NULL)
+        table <- clean_anova_table(get_anova_table(result))
+        if (!is.null(table)) {
+            table <- table %>%
+                mutate(Sex_group = sex_group_name,
+                       Analysis = "Infusions mixed ANOVA: Genotype x Day",
+                       .before = 1)
+        }
+        return(table)
+    } else {
+        result <- tryCatch({
+            inf_complete %>%
+                anova_test(dv = Infusions, wid = SubjectID,
+                           within = DayFactor)
+        }, error = function(e) NULL)
+        table <- clean_anova_table(get_anova_table(result))
+        if (!is.null(table)) {
+            table <- table %>%
+                mutate(Sex_group = sex_group_name,
+                       Analysis = "Infusions RM-ANOVA: Day",
+                       .before = 1)
+        }
+        return(table)
+    }
+}
+
+# 7G: Full infusion ANOVA with Sex
+run_full_infusion_anova <- function(data) {
+    infusion_data <- data %>%
+        select(SubjectID, Genotype, sex_clean,
+               Day_clean, Infusions) %>%
+        filter(!is.na(Infusions)) %>%
+        mutate(DayFactor = factor(Day_clean,
+                                  levels = sort(unique(Day_clean))))
+    if (nrow(infusion_data) == 0) return(NULL)
+    if (n_distinct(infusion_data$sex_clean) < 2) return(NULL)
+    
+    expected_rows <- length(unique(infusion_data$Day_clean))
+    complete_ids <- get_complete_subjects(
+        infusion_data, "SubjectID", expected_rows)
+    inf_complete <- infusion_data %>%
+        filter(SubjectID %in% complete_ids) %>%
+        droplevels()
+    if (n_distinct(inf_complete$SubjectID) < 4) return(NULL)
+    
+    if (genotype_mode && n_distinct(inf_complete$Genotype) == 2) {
+        result <- tryCatch({
+            inf_complete %>%
+                anova_test(dv = Infusions, wid = SubjectID,
+                           between = c(Genotype, sex_clean),
+                           within = DayFactor)
+        }, error = function(e) NULL)
+        table <- clean_anova_table(get_anova_table(result))
+        if (!is.null(table)) {
+            table <- table %>%
+                mutate(Analysis = "FULL: Infusions ~ Genotype x Sex x Day",
+                       .before = 1)
+            return(table)
+        }
+    }
+    # Fallback
+    result <- tryCatch({
+        inf_complete %>%
+            anova_test(dv = Infusions, wid = SubjectID,
+                       between = sex_clean, within = DayFactor)
+    }, error = function(e) NULL)
+    table <- clean_anova_table(get_anova_table(result))
+    if (!is.null(table)) {
+        table <- table %>%
+            mutate(Analysis = "FULL: Infusions ~ Sex x Day", .before = 1)
+    }
+    return(table)
+}
+
+# ============================================================
+# 8) PLOTTING FUNCTIONS
+# ============================================================
+
+make_old_style_plot <- function(summary_df, within_spout_tests,
+                                sex_group_name, genotype_name) {
+    
+    plot_df <- summary_df %>%
+        filter(Genotype == genotype_name, !is.na(Mean), Mean > 0)
+    if (nrow(plot_df) == 0) return(NULL)
+    
+    plot_error_df <- plot_df %>%
+        filter(!is.na(SEM), Mean - SEM > 0)
+    
+    day_breaks <- sort(unique(plot_df$Day_clean))
+    day_labels <- paste("Day", day_breaks)
+    
+    # Star positions
+    spout_star_df <- data.frame()
+    if (!is.null(within_spout_tests) && nrow(within_spout_tests) > 0) {
+        stars_raw <- within_spout_tests %>%
+            filter(Genotype == genotype_name, p < 0.05)
+        if (nrow(stars_raw) > 0) {
+            max_by_day <- plot_df %>%
+                filter(Measure %in% c("Active spout licks",
+                                      "Inactive spout licks")) %>%
+                group_by(Day_clean) %>%
+                summarise(
+                    max_val = max(Mean + ifelse(is.na(SEM), 0, SEM),
+                                  na.rm = TRUE),
+                    .groups = "drop")
+            max_by_day$y <- star_y_position(max_by_day$max_val,
+                                            use_log10_y_axis)
+            spout_star_df <- stars_raw %>%
+                inner_join(max_by_day, by = "Day_clean") %>%
+                mutate(label = p_star) %>%
+                filter(!is.na(y), label != "")
+        }
+    }
+    
+    p <- ggplot(plot_df, aes(x = Day_clean, y = Mean,
+                             group = Measure)) +
+        geom_line(aes(color = Measure, linetype = Measure),
+                  linewidth = 1.2) +
+        geom_errorbar(
+            data = plot_error_df,
+            aes(ymin = Mean - SEM, ymax = Mean + SEM,
+                color = Measure),
+            width = 0.15, linewidth = 0.7) +
+        geom_point(
+            aes(shape = Measure, fill = Measure,
+                color = Measure),
+            size = 5, stroke = 1.4) +
+        scale_x_continuous(breaks = day_breaks,
+                           labels = day_labels) +
+        scale_shape_manual(values = c(
+            "Active spout licks" = 16,
+            "Inactive spout licks" = 21,
+            "Infusions" = 15)) +
+        scale_fill_manual(values = c(
+            "Active spout licks" = "#9c1f5b",
+            "Inactive spout licks" = "white",
+            "Infusions" = "#9c1f5b")) +
+        scale_color_manual(values = c(
+            "Active spout licks" = "#9c1f5b",
+            "Inactive spout licks" = "black",
+            "Infusions" = "#9c1f5b")) +
+        scale_linetype_manual(values = c(
+            "Active spout licks" = "dashed",
+            "Inactive spout licks" = "dashed",
+            "Infusions" = "dashed")) +
+        labs(
+            title = paste(sex_group_name, "-", genotype_name),
+            x = NULL,
+            y = paste("Number of infusions or licks /",
+                      session_duration_label),
+            shape = NULL, fill = NULL,
+            color = NULL, linetype = NULL) +
+        theme_classic(base_size = 13) +
+        theme(
+            plot.title = element_text(face = "bold",
+                                      hjust = 0.5, size = 18),
+            axis.title.y = element_text(face = "bold", size = 15),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "right",
+            legend.text = element_text(size = 12),
+            legend.key = element_blank())
+    
+    if (nrow(spout_star_df) > 0) {
+        p <- p + geom_text(
+            data = spout_star_df,
+            aes(x = Day_clean, y = y, label = label),
+            inherit.aes = FALSE, size = 7, fontface = "bold")
+    }
+    if (use_log10_y_axis) p <- p + scale_y_log10()
+    return(p)
+}
+
+make_genotype_comparison_plot <- function(summary_df,
+                                          comparison_tests,
+                                          sex_group_name,
+                                          measure_name,
+                                          test_col_name = "SpoutType") {
+    
+    plot_df <- summary_df %>%
+        filter(Measure == measure_name, !is.na(Mean), Mean > 0)
+    if (nrow(plot_df) == 0 || n_distinct(plot_df$Genotype) < 2)
+        return(NULL)
+    
+    plot_error_df <- plot_df %>%
+        filter(!is.na(SEM), Mean - SEM > 0)
+    day_breaks <- sort(unique(plot_df$Day_clean))
+    day_labels <- paste("Day", day_breaks)
+    
+    # Stars
+    star_df <- data.frame()
+    if (!is.null(comparison_tests) && nrow(comparison_tests) > 0) {
+        if (test_col_name %in% names(comparison_tests)) {
+            spout_val <- ifelse(
+                measure_name == "Active spout licks",
+                "Active spout", "Inactive spout")
+            star_source <- comparison_tests %>%
+                filter(.data[[test_col_name]] == spout_val,
+                       p < 0.05)
+        } else {
+            star_source <- comparison_tests %>%
+                filter(p < 0.05)
+        }
+        if (nrow(star_source) > 0) {
+            max_by_day <- plot_df %>%
+                group_by(Day_clean) %>%
+                summarise(
+                    max_val = max(Mean + ifelse(is.na(SEM), 0, SEM),
+                                  na.rm = TRUE),
+                    .groups = "drop")
+            max_by_day$y <- star_y_position(max_by_day$max_val,
+                                            use_log10_y_axis)
+            star_df <- star_source %>%
+                inner_join(max_by_day, by = "Day_clean") %>%
+                mutate(label = p_star) %>%
+                filter(!is.na(y), label != "")
+        }
+    }
+    
+    y_lab <- ifelse(measure_name == "Infusions",
+                    paste("Infusions /", session_duration_label),
+                    paste("Licks /", session_duration_label))
+    
+    p <- ggplot(plot_df, aes(x = Day_clean, y = Mean,
+                             group = Genotype,
+                             color = Genotype,
+                             shape = Genotype)) +
+        geom_line(linewidth = 1.2) +
+        geom_errorbar(data = plot_error_df,
+                      aes(ymin = Mean - SEM, ymax = Mean + SEM),
+                      width = 0.15, linewidth = 0.7) +
+        geom_point(size = 5, stroke = 1.4) +
+        scale_x_continuous(breaks = day_breaks,
+                           labels = day_labels) +
+        scale_color_manual(values = c(
+            "Wild type" = "#9c1f5b",
+            "Cacna1c heterozygous" = "black")) +
+        scale_shape_manual(values = c(
+            "Wild type" = 16,
+            "Cacna1c heterozygous" = 17)) +
+        labs(
+            title = paste(sex_group_name, "-", measure_name,
+                          ": WT vs Cacna1c"),
+            x = NULL, y = y_lab,
+            color = NULL, shape = NULL) +
+        theme_classic(base_size = 13) +
+        theme(
+            plot.title = element_text(face = "bold",
+                                      hjust = 0.5, size = 16),
+            axis.title.y = element_text(face = "bold", size = 15),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "top",
+            legend.text = element_text(size = 12),
+            legend.key = element_blank())
+    
+    if (nrow(star_df) > 0) {
+        p <- p + geom_text(
+            data = star_df,
+            aes(x = Day_clean, y = y, label = label),
+            inherit.aes = FALSE, size = 7, fontface = "bold")
+    }
+    if (use_log10_y_axis) p <- p + scale_y_log10()
+    return(p)
+}
+
+# ============================================================
+# 9) RUN ONE SEX GROUP
+# ============================================================
+
+run_one_sex_group <- function(data, sex_group_name) {
+    
+    cat("\n\n############################################################\n")
+    cat("RUNNING SEX GROUP:", sex_group_name, "\n")
+    cat("############################################################\n")
+    
+    if (sex_group_name == "Both") {
+        df_sub <- data
+    } else {
+        df_sub <- data %>%
+            filter(sex_clean == sex_group_name) %>%
+            droplevels()
+    }
+    
+    if (nrow(df_sub) == 0) {
+        cat("\nNo data for this sex group. Skipping.\n")
+        return(NULL)
+    }
+    
+    cat("\nAnimals by genotype:\n")
+    print(df_sub %>% distinct(SubjectID, Genotype) %>%
+              count(Genotype, name = "N_animals"))
+    
+    licks_long <- make_licks_long(df_sub)
+    plot_long  <- make_plot_long(df_sub)
+    summary_df <- make_summary(plot_long)
+    
+    within_spout_tests <- tryCatch(
+        run_within_genotype_spout_tests_by_day(df_sub, sex_group_name),
+        error = function(e) { cat("  within_spout error:", conditionMessage(e), "\n"); NULL })
+    
+    genotype_spout_tests <- tryCatch(
+        run_genotype_tests_by_spout_and_day(licks_long, sex_group_name),
+        error = function(e) { cat("  geno_spout error:", conditionMessage(e), "\n"); NULL })
+    
+    genotype_infusion_tests <- tryCatch(
+        run_genotype_infusion_tests_by_day(df_sub, sex_group_name),
+        error = function(e) { cat("  geno_inf error:", conditionMessage(e), "\n"); NULL })
+    
+    licks_anova_table <- tryCatch(
+        run_licks_anova(licks_long, sex_group_name),
+        error = function(e) { cat("  licks_anova error:", conditionMessage(e), "\n"); NULL })
+    
+    infusion_anova_table <- tryCatch(
+        run_infusion_anova(df_sub, sex_group_name),
+        error = function(e) { cat("  inf_anova error:", conditionMessage(e), "\n"); NULL })
+    
+    base_name <- clean_filename(sex_group_name)
+    
+    # Save tables
+    write.csv(summary_df,
+              file.path(output_dir, paste0(base_name, "_summary_data.csv")),
+              row.names = FALSE)
+    if (!is.null(within_spout_tests) && nrow(within_spout_tests) > 0)
+        write.csv(within_spout_tests,
+                  file.path(output_dir, paste0(base_name, "_within_geno_spout_by_day.csv")),
+                  row.names = FALSE)
+    if (!is.null(genotype_spout_tests) && nrow(genotype_spout_tests) > 0)
+        write.csv(genotype_spout_tests,
+                  file.path(output_dir, paste0(base_name, "_geno_spout_by_day.csv")),
+                  row.names = FALSE)
+    if (!is.null(genotype_infusion_tests) && nrow(genotype_infusion_tests) > 0)
+        write.csv(genotype_infusion_tests,
+                  file.path(output_dir, paste0(base_name, "_geno_infusion_by_day.csv")),
+                  row.names = FALSE)
+    if (!is.null(licks_anova_table) && nrow(licks_anova_table) > 0)
+        write.csv(licks_anova_table,
+                  file.path(output_dir, paste0(base_name, "_licks_anova.csv")),
+                  row.names = FALSE)
+    if (!is.null(infusion_anova_table) && nrow(infusion_anova_table) > 0)
+        write.csv(infusion_anova_table,
+                  file.path(output_dir, paste0(base_name, "_infusion_anova.csv")),
+                  row.names = FALSE)
+    
+    # Old-style plots
+    geno_present <- unique(as.character(df_sub$Genotype))
+    geno_present <- geno_present[!is.na(geno_present)]
+    old_style_plots <- list()
+    
+    for (g in geno_present) {
+        p_old <- tryCatch(
+            make_old_style_plot(summary_df, within_spout_tests,
+                                sex_group_name, g),
+            error = function(e) NULL)
+        if (!is.null(p_old)) {
+            print(p_old)
+            ggsave(file.path(output_dir, paste0(
+                base_name, "_", clean_filename(g),
+                "_old_style.png")),
+                p_old, width = 9, height = 5.5, dpi = 300)
+            old_style_plots[[g]] <- p_old
+        }
+    }
+    
+    # Genotype comparison plots
+    active_geno_plot   <- NULL
+    inactive_geno_plot <- NULL
+    infusion_geno_plot <- NULL
+    
+    if (genotype_mode && n_distinct(df_sub$Genotype) == 2) {
+        active_geno_plot <- tryCatch(
+            make_genotype_comparison_plot(
+                summary_df, genotype_spout_tests,
+                sex_group_name, "Active spout licks", "SpoutType"),
+            error = function(e) NULL)
+        inactive_geno_plot <- tryCatch(
+            make_genotype_comparison_plot(
+                summary_df, genotype_spout_tests,
+                sex_group_name, "Inactive spout licks", "SpoutType"),
+            error = function(e) NULL)
+        infusion_geno_plot <- tryCatch(
+            make_genotype_comparison_plot(
+                summary_df, genotype_infusion_tests,
+                sex_group_name, "Infusions", "none"),
+            error = function(e) NULL)
+        
+        if (!is.null(active_geno_plot)) {
+            print(active_geno_plot)
+            ggsave(file.path(output_dir, paste0(
+                base_name, "_active_WT_vs_cacna1c.png")),
+                active_geno_plot, width = 8, height = 5.5, dpi = 300)
+        }
+        if (!is.null(inactive_geno_plot)) {
+            print(inactive_geno_plot)
+            ggsave(file.path(output_dir, paste0(
+                base_name, "_inactive_WT_vs_cacna1c.png")),
+                inactive_geno_plot, width = 8, height = 5.5, dpi = 300)
+        }
+        if (!is.null(infusion_geno_plot)) {
+            print(infusion_geno_plot)
+            ggsave(file.path(output_dir, paste0(
+                base_name, "_infusions_WT_vs_cacna1c.png")),
+                infusion_geno_plot, width = 8, height = 5.5, dpi = 300)
+        }
+    } else {
+        cat("\nGenotype comparison plots skipped for",
+            sex_group_name, "(only one genotype).\n")
+    }
+    
+    return(list(
+        sex_group               = sex_group_name,
+        summary_df              = summary_df,
+        within_spout_tests      = within_spout_tests,
+        genotype_spout_tests    = genotype_spout_tests,
+        genotype_infusion_tests = genotype_infusion_tests,
+        licks_anova_table       = licks_anova_table,
+        infusion_anova_table    = infusion_anova_table,
+        old_style_plots         = old_style_plots,
+        active_geno_plot        = active_geno_plot,
+        inactive_geno_plot      = inactive_geno_plot,
+        infusion_geno_plot      = infusion_geno_plot
+    ))
+}
+
+# ============================================================
+# 10) RUN ANALYSES
+# ============================================================
+
+sex_groups_to_run <- c("Female", "Male")
+if (run_both_combined_analysis) {
+    sex_groups_to_run <- c("Both", sex_groups_to_run)
+}
+
+results <- list()
+for (s in sex_groups_to_run) {
+    results[[s]] <- run_one_sex_group(df_clean, s)
+}
+
+# ============================================================
+# 11) COMBINE OUTPUT TABLES
+# ============================================================
+
+all_summary_tables <- safe_bind(
+    lapply(names(results), function(s) {
+        if (!is.null(results[[s]]$summary_df)) {
+            results[[s]]$summary_df %>% mutate(Sex_group = s, .before = 1)
+        }
+    }))
+
+all_within_spout_tests <- safe_bind(
+    lapply(names(results), function(s) results[[s]]$within_spout_tests))
+
+all_genotype_spout_tests <- safe_bind(
+    lapply(names(results), function(s) results[[s]]$genotype_spout_tests))
+
+all_genotype_infusion_tests <- safe_bind(
+    lapply(names(results), function(s) results[[s]]$genotype_infusion_tests))
+
+all_licks_anova_tables <- safe_bind(
+    lapply(names(results), function(s) results[[s]]$licks_anova_table))
+
+all_infusion_anova_tables <- safe_bind(
+    lapply(names(results), function(s) results[[s]]$infusion_anova_table))
+
+sample_size_table <- df_clean %>%
+    distinct(SubjectID, AID_clean, sex_clean, Genotype) %>%
+    count(sex_clean, Genotype, name = "N_animals") %>%
+    arrange(sex_clean, Genotype)
+
+# Full ANOVAs (Sex as between)
+all_licks_long <- make_licks_long(df_clean)
+full_licks_anova <- tryCatch(
+    run_full_licks_anova(all_licks_long),
+    error = function(e) NULL)
+full_infusion_anova <- tryCatch(
+    run_full_infusion_anova(df_clean),
+    error = function(e) NULL)
+
+# ============================================================
+# 12) SAVE COMBINED TABLES
+# ============================================================
+
+write.csv(all_summary_tables,
+          file.path(output_dir, "ALL_summary_data.csv"),
+          row.names = FALSE)
+write.csv(all_within_spout_tests,
+          file.path(output_dir, "ALL_within_geno_spout_by_day.csv"),
+          row.names = FALSE)
+if (nrow(all_genotype_spout_tests) > 0)
+    write.csv(all_genotype_spout_tests,
+              file.path(output_dir, "ALL_geno_spout_by_day.csv"),
+              row.names = FALSE)
+if (nrow(all_genotype_infusion_tests) > 0)
+    write.csv(all_genotype_infusion_tests,
+              file.path(output_dir, "ALL_geno_infusion_by_day.csv"),
+              row.names = FALSE)
+write.csv(all_licks_anova_tables,
+          file.path(output_dir, "ALL_licks_anova.csv"),
+          row.names = FALSE)
+write.csv(all_infusion_anova_tables,
+          file.path(output_dir, "ALL_infusion_anova.csv"),
+          row.names = FALSE)
+write.csv(sample_size_table,
+          file.path(output_dir, "ALL_sample_size.csv"),
+          row.names = FALSE)
+
+# ============================================================
+# 13) SPI ANALYSIS — TRAJECTORY (per day)
+# ============================================================
+
+cat("\n\n============================================================\n")
+cat("SPI ANALYSIS — SPOUT PREFERENCE INDEX\n")
+cat("============================================================\n")
+
+# Compute SPI per animal per day
+spi_data <- df_clean %>%
+    mutate(
+        TotalLicks = ActiveSpout + InactiveSpout,
+        SPI = ifelse(TotalLicks > 0,
+                     (ActiveSpout - InactiveSpout) / TotalLicks,
+                     NA_real_)
+    ) %>%
+    filter(!is.na(SPI))
+
+cat("\nSPI computed for", n_distinct(spi_data$SubjectID),
+    "animals across", n_distinct(spi_data$Day_clean), "days.\n")
+
+# 13A: SPI trajectory summary
+spi_summary <- spi_data %>%
+    group_by(sex_clean, Genotype, Day_clean) %>%
+    summarise(
+        Mean_SPI = mean(SPI, na.rm = TRUE),
+        N        = sum(!is.na(SPI)),
+        SEM_SPI  = ifelse(N > 1,
+                          sd(SPI, na.rm = TRUE) / sqrt(N),
+                          NA_real_),
+        .groups  = "drop"
+    )
+
+write.csv(spi_summary,
+          file.path(output_dir, "SPI_trajectory_summary.csv"),
+          row.names = FALSE)
+
+# 13B: SPI trajectory plot (per sex)
+for (sx in c("Female", "Male")) {
+    spi_plot_data <- spi_summary %>%
+        filter(sex_clean == sx, !is.na(Mean_SPI))
+    
+    if (nrow(spi_plot_data) == 0) next
+    
+    day_breaks <- sort(unique(spi_plot_data$Day_clean))
+    n_geno <- n_distinct(spi_plot_data$Genotype)
+    
+    p_spi <- ggplot(spi_plot_data,
+                    aes(x = Day_clean, y = Mean_SPI,
+                        group = Genotype,
+                        color = Genotype,
+                        shape = Genotype)) +
+        geom_hline(yintercept = 0, linetype = "dashed",
+                   color = "grey50") +
+        geom_line(linewidth = 1.2) +
+        geom_point(size = 5, stroke = 1.4) +
+        scale_x_continuous(breaks = day_breaks,
+                           labels = paste("Day", day_breaks)) +
+        scale_color_manual(values = c(
+            "Wild type" = "#9c1f5b",
+            "Cacna1c heterozygous" = "black",
+            "Single dataset" = "#9c1f5b")) +
+        scale_shape_manual(values = c(
+            "Wild type" = 16,
+            "Cacna1c heterozygous" = 17,
+            "Single dataset" = 16)) +
+        coord_cartesian(ylim = c(-1, 1)) +
+        labs(
+            title = paste(sx, "- Spout Preference Index (SPI)"),
+            x = NULL,
+            y = "SPI\n(Active - Inactive) / (Active + Inactive)",
+            color = NULL, shape = NULL) +
+        theme_classic(base_size = 13) +
+        theme(
+            plot.title = element_text(face = "bold",
+                                      hjust = 0.5, size = 16),
+            axis.title.y = element_text(face = "bold", size = 13),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "top",
+            legend.text = element_text(size = 12))
+    
+    if (nrow(spi_plot_data) > 0 &&
+        any(!is.na(spi_plot_data$SEM_SPI))) {
+        err_data <- spi_plot_data %>%
+            filter(!is.na(SEM_SPI))
+        p_spi <- p_spi + geom_errorbar(
+            data = err_data,
+            aes(ymin = Mean_SPI - SEM_SPI,
+                ymax = Mean_SPI + SEM_SPI),
+            width = 0.15, linewidth = 0.7)
+    }
+    
+    tryCatch({
+        print(p_spi)
+        ggsave(file.path(output_dir, paste0(
+            clean_filename(sx), "_SPI_trajectory.png")),
+            p_spi, width = 8, height = 5.5, dpi = 300)
+    }, error = function(e) cat("SPI plot error:", conditionMessage(e), "\n"))
+}
+
+# 13C: SPI ANOVA (Genotype x Day per sex)
+spi_anova_results <- list()
+
+for (sx in c("Female", "Male")) {
+    spi_sx <- spi_data %>%
+        filter(sex_clean == sx) %>%
+        mutate(DayFactor = factor(Day_clean,
+                                  levels = sort(unique(Day_clean)))) %>%
+        droplevels()
+    
+    if (nrow(spi_sx) == 0) next
+    
+    expected_n <- n_distinct(spi_sx$Day_clean)
+    complete_ids <- get_complete_subjects(spi_sx, "SubjectID", expected_n)
+    spi_complete <- spi_sx %>%
+        filter(SubjectID %in% complete_ids) %>%
+        droplevels()
+    
+    if (n_distinct(spi_complete$SubjectID) < 2) next
+    
+    if (genotype_mode && n_distinct(spi_complete$Genotype) == 2) {
+        result <- tryCatch({
+            spi_complete %>%
+                anova_test(dv = SPI, wid = SubjectID,
+                           between = Genotype, within = DayFactor)
+        }, error = function(e) NULL)
+    } else {
+        result <- tryCatch({
+            spi_complete %>%
+                anova_test(dv = SPI, wid = SubjectID,
+                           within = DayFactor)
+        }, error = function(e) NULL)
+    }
+    
+    table <- clean_anova_table(get_anova_table(result))
+    if (!is.null(table)) {
+        table <- table %>%
+            mutate(Sex_group = sx,
+                   Analysis = ifelse(
+                       genotype_mode && n_distinct(spi_complete$Genotype) == 2,
+                       "SPI mixed ANOVA: Genotype x Day",
+                       "SPI RM-ANOVA: Day"),
+                   .before = 1)
+        spi_anova_results[[sx]] <- table
+    }
+}
+
+all_spi_anova <- safe_bind(spi_anova_results)
+if (nrow(all_spi_anova) > 0) {
+    write.csv(all_spi_anova,
+              file.path(output_dir, "SPI_anova.csv"),
+              row.names = FALSE)
+}
+
+# 13D: SPI slope per animal
+spi_slopes <- spi_data %>%
+    group_by(SubjectID, AID_clean, sex_clean, Genotype) %>%
+    summarise(
+        n_days    = n(),
+        SPI_slope = ifelse(n_days >= 3,
+                           coef(lm(SPI ~ Day_clean))[2],
+                           NA_real_),
+        mean_SPI  = mean(SPI, na.rm = TRUE),
+        .groups   = "drop"
+    )
+
+write.csv(spi_slopes,
+          file.path(output_dir, "SPI_slopes_per_animal.csv"),
+          row.names = FALSE)
+
+# 13E: SPI slope genotype comparison
+spi_slope_tests <- list()
+for (sx in c("Female", "Male")) {
+    slopes_sx <- spi_slopes %>%
+        filter(sex_clean == sx, !is.na(SPI_slope))
+    
+    if (nrow(slopes_sx) == 0) next
+    
+    if (genotype_mode && n_distinct(slopes_sx$Genotype) == 2) {
+        wt_slopes  <- slopes_sx$SPI_slope[slopes_sx$Genotype == "Wild type"]
+        het_slopes <- slopes_sx$SPI_slope[slopes_sx$Genotype == "Cacna1c heterozygous"]
+        
+        if (length(wt_slopes) >= minimum_n_per_group_for_ttest &&
+            length(het_slopes) >= minimum_n_per_group_for_ttest) {
+            result <- tryCatch(
+                t.test(wt_slopes, het_slopes),
+                error = function(e) NULL)
+            if (!is.null(result)) {
+                spi_slope_tests[[sx]] <- data.frame(
+                    Sex_group  = sx,
+                    N_WT       = length(wt_slopes),
+                    N_Het      = length(het_slopes),
+                    Mean_slope_WT  = mean(wt_slopes),
+                    Mean_slope_Het = mean(het_slopes),
+                    p          = result$p.value,
+                    d_effect   = cohens_d_unpaired(wt_slopes, het_slopes),
+                    p_star     = p_to_star(result$p.value),
+                    test       = "Unpaired t-test: SPI slope WT vs Cacna1c")
+            }
+        }
+    }
+}
+all_spi_slope_tests <- safe_bind(spi_slope_tests)
+if (nrow(all_spi_slope_tests) > 0) {
+    write.csv(all_spi_slope_tests,
+              file.path(output_dir, "SPI_slope_genotype_comparison.csv"),
+              row.names = FALSE)
+}
+
+# ============================================================
+# 14) SPI PERIOD ANALYSIS — FIRST N vs LAST N DAYS
+#     (Matches GWAS phenotypes: "SANSA first 3 days...")
+# ============================================================
+
+cat("\n\n============================================================\n")
+cat("SPI PERIOD ANALYSIS — FIRST", first_n_days,
+    "vs LAST", last_n_days, "DAYS\n")
+cat("============================================================\n")
+
+all_days_sorted <- sort(unique(df_clean$Day_clean))
+n_total_days <- length(all_days_sorted)
+
+first_days <- all_days_sorted[seq_len(min(first_n_days, n_total_days))]
+last_days  <- all_days_sorted[seq(max(1, n_total_days - last_n_days + 1),
+                                   n_total_days)]
+
+cat("First", first_n_days, "days:", paste(first_days, collapse = ", "), "\n")
+cat("Last",  last_n_days,  "days:", paste(last_days, collapse = ", "),  "\n")
+
+# 14A: Compute mean SPI per animal per period
+spi_period <- spi_data %>%
+    mutate(
+        Period = dplyr::case_when(
+            Day_clean %in% first_days ~ paste0("First_", first_n_days),
+            Day_clean %in% last_days  ~ paste0("Last_", last_n_days),
+            TRUE ~ NA_character_
+        )
+    ) %>%
+    filter(!is.na(Period)) %>%
+    group_by(SubjectID, AID_clean, sex_clean, Genotype, Period) %>%
+    summarise(
+        n_days_in_period = n(),
+        Mean_SPI         = mean(SPI, na.rm = TRUE),
+        Mean_Active      = mean(ActiveSpout, na.rm = TRUE),
+        Mean_Inactive    = mean(InactiveSpout, na.rm = TRUE),
+        Mean_Infusions   = mean(Infusions, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    mutate(
+        Period = factor(Period,
+                        levels = c(paste0("First_", first_n_days),
+                                   paste0("Last_", last_n_days)))
+    )
+
+cat("\nSPI period data computed for",
+    n_distinct(spi_period$SubjectID), "animals.\n")
+
+write.csv(spi_period,
+          file.path(output_dir, "SPI_period_per_animal.csv"),
+          row.names = FALSE)
+
+# 14B: Period summary statistics
+spi_period_summary <- spi_period %>%
+    group_by(sex_clean, Genotype, Period) %>%
+    summarise(
+        N        = n(),
+        Mean_SPI = mean(Mean_SPI, na.rm = TRUE),
+        SD_SPI   = sd(Mean_SPI, na.rm = TRUE),
+        SEM_SPI  = ifelse(N > 1, SD_SPI / sqrt(N), NA_real_),
+        Mean_Active   = mean(Mean_Active, na.rm = TRUE),
+        Mean_Inactive = mean(Mean_Inactive, na.rm = TRUE),
+        Mean_Infusions = mean(Mean_Infusions, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+cat("\nSPI Period Summary:\n")
+print(spi_period_summary)
+
+write.csv(spi_period_summary,
+          file.path(output_dir, "SPI_period_summary.csv"),
+          row.names = FALSE)
+
+# 14C: Statistical tests on SPI periods
+spi_period_tests <- list()
+test_counter <- 0
+
+for (sx in c("Female", "Male")) {
+    
+    period_sx <- spi_period %>%
+        filter(sex_clean == sx)
+    
+    if (nrow(period_sx) == 0) next
+    
+    cat("\n--- SPI Period Tests:", sx, "---\n")
+    
+    # ---- Test 1: Period x Genotype mixed ANOVA ----
+    if (genotype_mode && n_distinct(period_sx$Genotype) == 2) {
+        # Need animals with BOTH periods
+        both_periods <- period_sx %>%
+            group_by(SubjectID) %>%
+            filter(n() == 2) %>%
+            ungroup() %>%
+            droplevels()
+        
+        if (n_distinct(both_periods$SubjectID) >= 4 &&
+            n_distinct(both_periods$Genotype) == 2) {
+            
+            result <- tryCatch({
+                both_periods %>%
+                    anova_test(dv = Mean_SPI, wid = SubjectID,
+                               between = Genotype, within = Period)
+            }, error = function(e) NULL)
+            
+            table <- clean_anova_table(get_anova_table(result))
+            if (!is.null(table)) {
+                test_counter <- test_counter + 1
+                table <- table %>%
+                    mutate(Sex_group = sx,
+                           Analysis = "SPI Period x Genotype mixed ANOVA",
+                           .before = 1)
+                spi_period_tests[[paste0("anova_", sx)]] <- table
+                cat("  Period x Genotype ANOVA:\n")
+                print(table)
+            }
+        } else {
+            cat("  Period x Genotype ANOVA skipped: insufficient data.\n")
+        }
+    } else {
+        # Single genotype: Period RM-ANOVA
+        both_periods <- period_sx %>%
+            group_by(SubjectID) %>%
+            filter(n() == 2) %>%
+            ungroup() %>%
+            droplevels()
+        
+        if (n_distinct(both_periods$SubjectID) >= 2) {
+            result <- tryCatch({
+                both_periods %>%
+                    anova_test(dv = Mean_SPI, wid = SubjectID,
+                               within = Period)
+            }, error = function(e) NULL)
+            
+            table <- clean_anova_table(get_anova_table(result))
+            if (!is.null(table)) {
+                test_counter <- test_counter + 1
+                table <- table %>%
+                    mutate(Sex_group = sx,
+                           Analysis = "SPI Period RM-ANOVA",
+                           .before = 1)
+                spi_period_tests[[paste0("anova_", sx)]] <- table
+                cat("  Period RM-ANOVA:\n")
+                print(table)
+            }
+        }
+    }
+    
+    # ---- Test 2: Paired t-test First vs Last within each genotype ----
+    geno_present <- unique(as.character(period_sx$Genotype))
+    for (g in geno_present) {
+        period_g <- period_sx %>% filter(Genotype == g)
+        
+        # Get animals with both periods
+        first_label <- paste0("First_", first_n_days)
+        last_label  <- paste0("Last_", last_n_days)
+        
+        first_vals <- period_g %>%
+            filter(Period == first_label) %>%
+            arrange(SubjectID)
+        last_vals <- period_g %>%
+            filter(Period == last_label) %>%
+            arrange(SubjectID)
+        
+        # Match by SubjectID
+        common_ids <- intersect(first_vals$SubjectID,
+                                last_vals$SubjectID)
+        
+        if (length(common_ids) >= minimum_n_per_group_for_ttest) {
+            f_matched <- first_vals %>%
+                filter(SubjectID %in% common_ids) %>%
+                arrange(SubjectID)
+            l_matched <- last_vals %>%
+                filter(SubjectID %in% common_ids) %>%
+                arrange(SubjectID)
+            
+            result <- tryCatch(
+                t.test(l_matched$Mean_SPI, f_matched$Mean_SPI,
+                       paired = TRUE),
+                error = function(e) NULL)
+            
+            if (!is.null(result)) {
+                test_counter <- test_counter + 1
+                test_row <- data.frame(
+                    Sex_group     = sx,
+                    Genotype      = g,
+                    Comparison    = paste0("Paired: Last ", last_n_days,
+                                          " vs First ", first_n_days),
+                    N             = length(common_ids),
+                    Mean_First    = mean(f_matched$Mean_SPI),
+                    Mean_Last     = mean(l_matched$Mean_SPI),
+                    Delta         = mean(l_matched$Mean_SPI) -
+                        mean(f_matched$Mean_SPI),
+                    p             = result$p.value,
+                    d_effect      = cohens_d_paired(
+                        l_matched$Mean_SPI, f_matched$Mean_SPI),
+                    p_star        = p_to_star(result$p.value),
+                    test          = "Paired t-test: Last vs First SPI"
+                )
+                spi_period_tests[[paste0("paired_", sx, "_", g)]] <- test_row
+                cat("  Paired First vs Last (", g, "):\n")
+                cat("    Mean First =", round(mean(f_matched$Mean_SPI), 3),
+                    " Mean Last =", round(mean(l_matched$Mean_SPI), 3),
+                    " p =", round(result$p.value, 4),
+                    " d =", round(test_row$d_effect, 3), "\n")
+            }
+        } else {
+            cat("  Paired First vs Last (", g,
+                ") skipped: N =", length(common_ids), "\n")
+        }
+    }
+    
+    # ---- Test 3: WT vs Cacna1c on LAST N days SPI ----
+    if (genotype_mode && n_distinct(period_sx$Genotype) == 2) {
+        last_only <- period_sx %>%
+            filter(Period == paste0("Last_", last_n_days))
+        
+        wt_last  <- last_only$Mean_SPI[last_only$Genotype == "Wild type"]
+        het_last <- last_only$Mean_SPI[last_only$Genotype == "Cacna1c heterozygous"]
+        
+        if (length(wt_last) >= minimum_n_per_group_for_ttest &&
+            length(het_last) >= minimum_n_per_group_for_ttest) {
+            
+            result <- tryCatch(
+                t.test(wt_last, het_last),
+                error = function(e) NULL)
+            
+            if (!is.null(result)) {
+                test_counter <- test_counter + 1
+                test_row <- data.frame(
+                    Sex_group   = sx,
+                    Comparison  = paste0("WT vs Cacna1c: Last ",
+                                        last_n_days, " days SPI"),
+                    N_WT        = length(wt_last),
+                    N_Het       = length(het_last),
+                    Mean_WT     = mean(wt_last),
+                    Mean_Het    = mean(het_last),
+                    p           = result$p.value,
+                    d_effect    = cohens_d_unpaired(wt_last, het_last),
+                    p_star      = p_to_star(result$p.value),
+                    test        = "Unpaired t-test: WT vs Cacna1c Last SPI"
+                )
+                spi_period_tests[[paste0("geno_last_", sx)]] <- test_row
+                cat("  WT vs Cacna1c Last", last_n_days, ":\n")
+                cat("    Mean WT =", round(mean(wt_last), 3),
+                    " Mean Het =", round(mean(het_last), 3),
+                    " p =", round(result$p.value, 4),
+                    " d =", round(test_row$d_effect, 3), "\n")
+            }
+        }
+        
+        # ---- Test 4: WT vs Cacna1c on FIRST N days SPI ----
+        first_only <- period_sx %>%
+            filter(Period == paste0("First_", first_n_days))
+        
+        wt_first  <- first_only$Mean_SPI[first_only$Genotype == "Wild type"]
+        het_first <- first_only$Mean_SPI[first_only$Genotype == "Cacna1c heterozygous"]
+        
+        if (length(wt_first) >= minimum_n_per_group_for_ttest &&
+            length(het_first) >= minimum_n_per_group_for_ttest) {
+            
+            result <- tryCatch(
+                t.test(wt_first, het_first),
+                error = function(e) NULL)
+            
+            if (!is.null(result)) {
+                test_counter <- test_counter + 1
+                test_row <- data.frame(
+                    Sex_group   = sx,
+                    Comparison  = paste0("WT vs Cacna1c: First ",
+                                        first_n_days, " days SPI"),
+                    N_WT        = length(wt_first),
+                    N_Het       = length(het_first),
+                    Mean_WT     = mean(wt_first),
+                    Mean_Het    = mean(het_first),
+                    p           = result$p.value,
+                    d_effect    = cohens_d_unpaired(wt_first, het_first),
+                    p_star      = p_to_star(result$p.value),
+                    test        = "Unpaired t-test: WT vs Cacna1c First SPI"
+                )
+                spi_period_tests[[paste0("geno_first_", sx)]] <- test_row
+                cat("  WT vs Cacna1c First", first_n_days, ":\n")
+                cat("    Mean WT =", round(mean(wt_first), 3),
+                    " Mean Het =", round(mean(het_first), 3),
+                    " p =", round(result$p.value, 4),
+                    " d =", round(test_row$d_effect, 3), "\n")
+            }
+        }
+    }
+}
+
+all_spi_period_tests <- safe_bind(spi_period_tests)
+if (nrow(all_spi_period_tests) > 0) {
+    write.csv(all_spi_period_tests,
+              file.path(output_dir, "SPI_period_tests.csv"),
+              row.names = FALSE)
+}
+
+cat("\n", test_counter, "SPI period tests completed.\n")
+
+# 14D: SPI Period bar + jitter plots
+for (sx in c("Female", "Male")) {
+    
+    period_sx <- spi_period %>% filter(sex_clean == sx)
+    if (nrow(period_sx) == 0) next
+    
+    summ_sx <- spi_period_summary %>% filter(sex_clean == sx)
+    if (nrow(summ_sx) == 0) next
+    
+    # Build significance label from tests
+    sig_label <- ""
+    paired_key <- paste0("paired_", sx, "_Wild type")
+    if (paired_key %in% names(spi_period_tests)) {
+        paired_p <- spi_period_tests[[paired_key]]$p[1]
+        if (!is.na(paired_p) && paired_p < 0.05) {
+            sig_label <- p_to_star(paired_p)
+        }
+    }
+    
+    p_bar <- ggplot(summ_sx,
+                    aes(x = Period, y = Mean_SPI,
+                        fill = Genotype)) +
+        geom_hline(yintercept = 0, linetype = "dashed",
+                   color = "grey50") +
+        geom_col(position = position_dodge(width = 0.8),
+                 width = 0.7, alpha = 0.7,
+                 color = "black", linewidth = 0.5) +
+        geom_errorbar(
+            aes(ymin = Mean_SPI - SEM_SPI,
+                ymax = Mean_SPI + SEM_SPI),
+            position = position_dodge(width = 0.8),
+            width = 0.2, linewidth = 0.7) +
+        geom_jitter(
+            data = period_sx,
+            aes(x = Period, y = Mean_SPI, fill = Genotype),
+            position = position_jitterdodge(
+                jitter.width = 0.15, dodge.width = 0.8),
+            size = 2.5, shape = 21, color = "black",
+            alpha = 0.8) +
+        scale_fill_manual(values = c(
+            "Wild type" = "#9c1f5b",
+            "Cacna1c heterozygous" = "grey60",
+            "Single dataset" = "#9c1f5b")) +
+        scale_x_discrete(labels = c(
+            setNames(paste0("First ", first_n_days),
+                     paste0("First_", first_n_days)),
+            setNames(paste0("Last ", last_n_days),
+                     paste0("Last_", last_n_days))
+        )) +
+        coord_cartesian(ylim = c(-0.5, 1)) +
+        labs(
+            title = paste(sx, "- SPI: First", first_n_days,
+                          "vs Last", last_n_days, "Days"),
+            x = "Session Period",
+            y = "Mean SPI\n(Active - Inactive) / (Active + Inactive)",
+            fill = NULL) +
+        theme_classic(base_size = 14) +
+        theme(
+            plot.title = element_text(face = "bold",
+                                      hjust = 0.5, size = 16),
+            axis.title = element_text(face = "bold", size = 13),
+            axis.text  = element_text(size = 12),
+            legend.position = "top",
+            legend.text = element_text(size = 12))
+    
+    tryCatch({
+        print(p_bar)
+        ggsave(file.path(output_dir, paste0(
+            clean_filename(sx), "_SPI_period_bar.png")),
+            p_bar, width = 7, height = 6, dpi = 300)
+    }, error = function(e) cat("SPI period bar error:",
+                               conditionMessage(e), "\n"))
+    
+    # Individual animal trajectory (First → Last) paired line plot
+    both_periods <- period_sx %>%
+        group_by(SubjectID) %>%
+        filter(n() == 2) %>%
+        ungroup()
+    
+    if (nrow(both_periods) >= 4) {
+        p_paired <- ggplot(both_periods,
+                           aes(x = Period, y = Mean_SPI,
+                               group = SubjectID,
+                               color = Genotype)) +
+            geom_hline(yintercept = 0, linetype = "dashed",
+                       color = "grey50") +
+            geom_line(alpha = 0.4, linewidth = 0.8) +
+            geom_point(size = 3, alpha = 0.7) +
+            stat_summary(
+                aes(group = Genotype),
+                fun = mean, geom = "line",
+                linewidth = 2, alpha = 1) +
+            stat_summary(
+                aes(group = Genotype),
+                fun = mean, geom = "point",
+                size = 5, alpha = 1) +
+            scale_color_manual(values = c(
+                "Wild type" = "#9c1f5b",
+                "Cacna1c heterozygous" = "black",
+                "Single dataset" = "#9c1f5b")) +
+            scale_x_discrete(labels = c(
+                setNames(paste0("First ", first_n_days),
+                         paste0("First_", first_n_days)),
+                setNames(paste0("Last ", last_n_days),
+                         paste0("Last_", last_n_days))
+            )) +
+            coord_cartesian(ylim = c(-0.5, 1)) +
+            labs(
+                title = paste(sx,
+                              "- Individual SPI Change: First → Last"),
+                subtitle = "Thin lines = individual animals; Thick = group mean",
+                x = "Session Period",
+                y = "Mean SPI",
+                color = NULL) +
+            theme_classic(base_size = 14) +
+            theme(
+                plot.title    = element_text(face = "bold",
+                                             hjust = 0.5, size = 16),
+                plot.subtitle = element_text(hjust = 0.5, size = 11,
+                                             color = "grey40"),
+                axis.title    = element_text(face = "bold", size = 13),
+                legend.position = "top",
+                legend.text   = element_text(size = 12))
+        
+        tryCatch({
+            print(p_paired)
+            ggsave(file.path(output_dir, paste0(
+                clean_filename(sx), "_SPI_period_paired_lines.png")),
+                p_paired, width = 7, height = 6, dpi = 300)
+        }, error = function(e) cat("SPI paired line error:",
+                                   conditionMessage(e), "\n"))
+    }
+}
+
+# ============================================================
+# 15) SAVE EXCEL WORKBOOK
+# ============================================================
+
+excel_output_file <- file.path(
+    output_dir,
+    "ALL_statistics_tables_final.xlsx"
+)
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Summary_Data")
+writeData(wb, "Summary_Data", all_summary_tables)
+
+addWorksheet(wb, "Within_Spout_Tests")
+writeData(wb, "Within_Spout_Tests", all_within_spout_tests)
+
+if (nrow(all_genotype_spout_tests) > 0) {
+    addWorksheet(wb, "Geno_Spout_Day")
+    writeData(wb, "Geno_Spout_Day", all_genotype_spout_tests)
+}
+
+if (nrow(all_genotype_infusion_tests) > 0) {
+    addWorksheet(wb, "Geno_Infusion_Day")
+    writeData(wb, "Geno_Infusion_Day", all_genotype_infusion_tests)
+}
+
+addWorksheet(wb, "Licks_ANOVA")
+writeData(wb, "Licks_ANOVA", all_licks_anova_tables)
+
+addWorksheet(wb, "Infusion_ANOVA")
+writeData(wb, "Infusion_ANOVA", all_infusion_anova_tables)
+
+if (!is.null(full_licks_anova)) {
+    addWorksheet(wb, "Full_Licks_ANOVA")
+    writeData(wb, "Full_Licks_ANOVA", full_licks_anova)
+}
+if (!is.null(full_infusion_anova)) {
+    addWorksheet(wb, "Full_Infusion_ANOVA")
+    writeData(wb, "Full_Infusion_ANOVA", full_infusion_anova)
+}
+
+addWorksheet(wb, "Sample_Size")
+writeData(wb, "Sample_Size", sample_size_table)
+
+# SPI sheets
+addWorksheet(wb, "SPI_Trajectory")
+writeData(wb, "SPI_Trajectory", spi_summary)
+
+if (nrow(all_spi_anova) > 0) {
+    addWorksheet(wb, "SPI_ANOVA")
+    writeData(wb, "SPI_ANOVA", all_spi_anova)
+}
+
+addWorksheet(wb, "SPI_Slopes")
+writeData(wb, "SPI_Slopes", spi_slopes)
+
+if (nrow(all_spi_slope_tests) > 0) {
+    addWorksheet(wb, "SPI_Slope_Tests")
+    writeData(wb, "SPI_Slope_Tests", all_spi_slope_tests)
+}
+
+# SPI Period sheets
+addWorksheet(wb, "SPI_Period_Data")
+writeData(wb, "SPI_Period_Data", spi_period)
+
+addWorksheet(wb, "SPI_Period_Summary")
+writeData(wb, "SPI_Period_Summary", spi_period_summary)
+
+if (nrow(all_spi_period_tests) > 0) {
+    addWorksheet(wb, "SPI_Period_Tests")
+    writeData(wb, "SPI_Period_Tests", all_spi_period_tests)
+}
+
+# Audit sheets
+addWorksheet(wb, "AUDIT_Genotype_Roster")
+writeData(wb, "AUDIT_Genotype_Roster", genotype_roster)
+
+addWorksheet(wb, "AUDIT_Day_Completeness")
+writeData(wb, "AUDIT_Day_Completeness", completeness)
+
+addWorksheet(wb, "AUDIT_Raw_Data_Dump")
+writeData(wb, "AUDIT_Raw_Data_Dump", raw_dump)
+
+day_issues_export <- day_issues %>%
+    filter(has_dups | has_gaps)
+if (nrow(day_issues_export) > 0) {
+    addWorksheet(wb, "AUDIT_Day_Issues")
+    writeData(wb, "AUDIT_Day_Issues", day_issues_export)
+}
+
+if (nrow(sanity_flags) > 0) {
+    addWorksheet(wb, "AUDIT_Sanity_Flags")
+    writeData(wb, "AUDIT_Sanity_Flags", sanity_flags)
+}
+
+saveWorkbook(wb, excel_output_file, overwrite = TRUE)
+
+# ============================================================
+# 16) CONSOLE SUMMARY
+# ============================================================
+
+cat("\n\n============================================================\n")
+cat("ANALYSIS COMPLETED SUCCESSFULLY\n")
+cat("============================================================\n")
+
+cat("\nMode:",
+    ifelse(genotype_mode,
+           "Genotype (Wild type vs Cacna1c heterozygous)",
+           "Single-dataset"), "\n")
+
+cat("\nSample size:\n")
+print(sample_size_table)
+
+cat("\nKey licks ANOVA tables:\n")
+print(all_licks_anova_tables)
+
+if (!is.null(full_licks_anova)) {
+    cat("\nFull licks ANOVA (Sex as between factor):\n")
+    print(full_licks_anova)
+}
+
+cat("\nSPI trajectory ANOVA:\n")
+if (nrow(all_spi_anova) > 0) print(all_spi_anova)
+
+cat("\nSPI slope genotype comparison:\n")
+if (nrow(all_spi_slope_tests) > 0) print(all_spi_slope_tests)
+
+cat("\nSPI period analysis (First", first_n_days,
+    "vs Last", last_n_days, "):\n")
+if (nrow(all_spi_period_tests) > 0) print(all_spi_period_tests)
+
+cat("\nAll outputs saved in:\n", output_dir, "\n")
+cat("Excel file:", excel_output_file, "\n")
+cat("Audit report:", audit_file, "\n")
